@@ -269,21 +269,25 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 
 		startBlock = s.backfillCursor
 	} else {
-		maxHeight, err := s.ch.GetMaxHeight(ctx)
-		if err != nil {
-			log.Printf("Backfill: Failed to get max height: %v", err)
-			return true
-		}
-
-		if maxHeight == 0 {
-			if s.startHeight > 0 {
-				startBlock = s.startHeight
-			} else {
-				startBlock = 1 // Genesis
+		// If backfillCursor is not set (0), initialize it from DB
+		if s.backfillCursor == 0 {
+			maxHeight, err := s.ch.GetMaxHeight(ctx)
+			if err != nil {
+				log.Printf("Backfill: Failed to get max height: %v", err)
+				return true
 			}
-		} else {
-			startBlock = maxHeight + 1
+
+			if maxHeight == 0 {
+				if s.startHeight > 0 {
+					s.backfillCursor = s.startHeight
+				} else {
+					s.backfillCursor = 1 // Genesis
+				}
+			} else {
+				s.backfillCursor = maxHeight + 1
+			}
 		}
+		startBlock = s.backfillCursor
 	}
 
 	if startBlock > latestHeight {
@@ -321,9 +325,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 		}
 	}
 
-	if s.fillGaps {
-		s.backfillCursor = endBlock + 1
-	}
+	s.backfillCursor = endBlock + 1
 
 	return false // Not synced yet
 }
