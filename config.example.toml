@@ -1,0 +1,28 @@
+[server]
+listen_addr = ":3000"
+cors_allowed_origins = ["*"]
+excluded_accounts = [] # Add addresses to exclude from circulating supply, e.g. ["terra1...", "terra1..."]
+
+[database]
+clickhouse_addr = "localhost:9000"
+clickhouse_db = "default"
+clickhouse_user = "default"
+clickhouse_password = ""
+postgres_conn = "postgres://user:password@localhost:5432/fcd"
+
+[node]
+rpc = "http://localhost:26657"
+grpc = "localhost:9090"
+
+[ingest]
+block_poll_interval = "1s"
+backfill_interval = "0s" # Delay between backfill batches (0s = fast as possible)
+backfill_batch_size = 10 # Number of blocks to fetch per batch
+richlist_update_interval = "1h"
+start_height = 0 # Set to > 0 to start indexing from a specific height (e.g. 25616144)
+end_height = 0   # Set to > 0 to stop indexing at a specific height
+fill_gaps = false # Set to true to check for missing blocks in the range and fill them (slower backfill)
+
+[log]
+level = "info"
+# file_path = "" # Leave empty to use default separate logs (indexer-api.log / indexer-ingest.log)
