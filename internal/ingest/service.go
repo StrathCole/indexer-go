@@ -468,6 +468,14 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		results.EndBlockEvents,
 	)
 
+	// Extract Block Rewards and Validator Returns
+	allBlockEvents := append(results.BeginBlockEvents, results.EndBlockEvents...)
+	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		allBlockEvents,
+	)
+
 	var modelTxs []model.Tx
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
@@ -517,7 +525,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	}
 
 	// Insert everything in one batch
-	err := s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices)
+	err := s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices, validatorReturns, blockRewards)
 	if err != nil {
 		log.Printf("Failed to insert block/txs: %v", err)
 		return err

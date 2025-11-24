@@ -14,6 +14,8 @@ func (s *Service) BatchInsert(
 	events []model.Event,
 	accountTxs []model.AccountTx,
 	oraclePrices []model.OraclePrice,
+	validatorReturns []model.ValidatorReturn,
+	blockRewards []model.BlockReward,
 ) error {
 	if len(txs) > 0 {
 		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO txs")
@@ -120,6 +122,49 @@ func (s *Service) BatchInsert(
 		}
 		if err := batch.Send(); err != nil {
 			return fmt.Errorf("failed to send oracle_prices batch: %w", err)
+		}
+	}
+
+	if len(validatorReturns) > 0 {
+		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO validator_returns")
+		if err != nil {
+			return fmt.Errorf("failed to prepare validator_returns batch: %w", err)
+		}
+		for _, vr := range validatorReturns {
+			err := batch.Append(
+				vr.BlockTime,
+				vr.Height,
+				vr.OperatorAddress,
+				vr.Commission,
+				vr.Reward,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to append validator_return: %w", err)
+			}
+		}
+		if err := batch.Send(); err != nil {
+			return fmt.Errorf("failed to send validator_returns batch: %w", err)
+		}
+	}
+
+	if len(blockRewards) > 0 {
+		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO block_rewards")
+		if err != nil {
+			return fmt.Errorf("failed to prepare block_rewards batch: %w", err)
+		}
+		for _, br := range blockRewards {
+			err := batch.Append(
+				br.BlockTime,
+				br.Height,
+				br.TotalReward,
+				br.TotalCommission,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to append block_reward: %w", err)
+			}
+		}
+		if err := batch.Send(); err != nil {
+			return fmt.Errorf("failed to send block_rewards batch: %w", err)
 		}
 	}
 

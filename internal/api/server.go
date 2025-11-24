@@ -12,6 +12,7 @@ import (
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	tmtypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/cosmos-sdk/client"
+	gateway "github.com/cosmos/gogogateway"
 	"github.com/gorilla/mux"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/rs/zerolog/log"
@@ -100,7 +101,13 @@ func (s *Server) Router() http.Handler {
 
 	// Proxy to LCD (Embedded GRPC Gateway)
 	// We create a new ServeMux for the gateway
-	gwMux := runtime.NewServeMux()
+	gwMux := runtime.NewServeMux(
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &gateway.JSONPb{
+			EmitDefaults: true,
+			OrigName:     true,
+			Indent:       "  ",
+		}),
+	)
 	// Register routes
 	app.ModuleBasics.RegisterGRPCGatewayRoutes(s.clientCtx, gwMux)
 

@@ -74,3 +74,5 @@ CREATE TABLE IF NOT EXISTS rich_list (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rich_list_denom_amount ON rich_list(denom, amount DESC);
+
+-- Unvested Schedule (Supply tracking) - REMOVED as unused on chain

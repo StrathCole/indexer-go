@@ -76,3 +76,26 @@ CREATE TABLE IF NOT EXISTS oracle_prices (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
 ORDER BY (denom, block_time);
+
+-- Validator Returns (Historical) - Replaces ValidatorReturnInfoEntity
+CREATE TABLE IF NOT EXISTS validator_returns (
+    block_time      DateTime,
+    height          UInt64,
+    operator_address String,
+    commission      Map(String, Float64),
+    reward          Map(String, Float64)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(block_time)
+ORDER BY (operator_address, block_time);
+
+-- Block Rewards (Historical) - Replaces BlockRewardEntity
+CREATE TABLE IF NOT EXISTS block_rewards (
+    block_time      DateTime,
+    height          UInt64,
+    total_reward    Map(String, Float64),
+    total_commission Map(String, Float64)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(block_time)
+ORDER BY (block_time);

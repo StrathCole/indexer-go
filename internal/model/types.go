@@ -68,3 +68,20 @@ type OraclePrice struct {
 	Price     float64   `ch:"price"`
 	Currency  string    `ch:"currency"`
 }
+
+// ValidatorReturn represents a validator return record in ClickHouse
+type ValidatorReturn struct {
+	BlockTime       time.Time          `ch:"block_time"`
+	Height          uint64             `ch:"height"`
+	OperatorAddress string             `ch:"operator_address"`
+	Commission      map[string]float64 `ch:"commission"`
+	Reward          map[string]float64 `ch:"reward"`
+}
+
+// BlockReward represents a block reward record in ClickHouse
+type BlockReward struct {
+	BlockTime       time.Time          `ch:"block_time"`
+	Height          uint64             `ch:"height"`
+	TotalReward     map[string]float64 `ch:"total_reward"`
+	TotalCommission map[string]float64 `ch:"total_commission"`
+}

@@ -185,24 +185,24 @@ func (s *Service) convertTx(
 	}
 
 	modelTx := &model.Tx{
-		Height:       height,
-		IndexInBlock: index,
-		BlockTime:    blockTime,
-		TxHash:       txHashRaw,
-		Codespace:    res.Codespace,
-		Code:         res.Code,
-		GasWanted:    uint64(res.GasWanted),
-		GasUsed:      uint64(res.GasUsed),
-		FeeAmounts:   feeAmounts,
-		FeeDenomIDs:  feeDenomIDs,
-		TaxAmounts:   taxAmounts,
-		TaxDenomIDs:  taxDenomIDs,
-		MsgTypeIDs:   msgTypeIDs,
-		MsgsJSON:     msgsJSON,
+		Height:         height,
+		IndexInBlock:   index,
+		BlockTime:      blockTime,
+		TxHash:         txHashRaw,
+		Codespace:      res.Codespace,
+		Code:           res.Code,
+		GasWanted:      uint64(res.GasWanted),
+		GasUsed:        uint64(res.GasUsed),
+		FeeAmounts:     feeAmounts,
+		FeeDenomIDs:    feeDenomIDs,
+		TaxAmounts:     taxAmounts,
+		TaxDenomIDs:    taxDenomIDs,
+		MsgTypeIDs:     msgTypeIDs,
+		MsgsJSON:       msgsJSON,
 		SignaturesJSON: signaturesJSON,
-		Memo:         memo,
-		RawLog:       res.Log,
-		LogsJSON:     res.Log,
+		Memo:           memo,
+		RawLog:         res.Log,
+		LogsJSON:       res.Log,
 	}
 
 	// Extract Events
@@ -434,4 +434,98 @@ func (s *Service) convertBlockEvents(
 		}
 	}
 	return modelEvents
+}
+
+func (s *Service) extractBlockRewardsAndReturns(
+	height uint64,
+	blockTime time.Time,
+	events []abcitypes.Event,
+) ([]model.BlockReward, []model.ValidatorReturn) {
+	var blockRewards []model.BlockReward
+	var validatorReturns []model.ValidatorReturn
+
+	totalReward := make(map[string]float64)
+	totalCommission := make(map[string]float64)
+
+	// Temporary maps to aggregate per validator
+	valRewards := make(map[string]map[string]float64)
+	valCommissions := make(map[string]map[string]float64)
+
+	for _, event := range events {
+		if event.Type == "rewards" || event.Type == "commission" {
+			var amountStr string
+			var validator string
+
+			for _, attr := range event.Attributes {
+				key := string(attr.Key)
+				value := string(attr.Value)
+				if key == "amount" {
+					amountStr = value
+				} else if key == "validator" {
+					validator = value
+				}
+			}
+
+			if amountStr != "" && validator != "" {
+				coins, err := sdk.ParseCoinsNormalized(amountStr)
+				if err == nil {
+					for _, coin := range coins {
+						amount := float64(coin.Amount.Int64()) // Use float for aggregation simplicity
+
+						if event.Type == "rewards" {
+							// Total Reward
+							totalReward[coin.Denom] += amount
+
+							// Per Validator Reward
+							if _, ok := valRewards[validator]; !ok {
+								valRewards[validator] = make(map[string]float64)
+							}
+							valRewards[validator][coin.Denom] += amount
+						} else {
+							// Total Commission
+							totalCommission[coin.Denom] += amount
+
+							// Per Validator Commission
+							if _, ok := valCommissions[validator]; !ok {
+								valCommissions[validator] = make(map[string]float64)
+							}
+							valCommissions[validator][coin.Denom] += amount
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Create BlockReward
+	if len(totalReward) > 0 || len(totalCommission) > 0 {
+		blockRewards = append(blockRewards, model.BlockReward{
+			BlockTime:       blockTime,
+			Height:          height,
+			TotalReward:     totalReward,
+			TotalCommission: totalCommission,
+		})
+	}
+
+	// Create ValidatorReturns
+	// We iterate over all validators found in either rewards or commissions
+	validators := make(map[string]bool)
+	for v := range valRewards {
+		validators[v] = true
+	}
+	for v := range valCommissions {
+		validators[v] = true
+	}
+
+	for v := range validators {
+		validatorReturns = append(validatorReturns, model.ValidatorReturn{
+			BlockTime:       blockTime,
+			Height:          height,
+			OperatorAddress: v,
+			Reward:          valRewards[v],
+			Commission:      valCommissions[v],
+		})
+	}
+
+	return blockRewards, validatorReturns
 }
