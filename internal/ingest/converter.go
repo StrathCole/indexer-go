@@ -86,6 +86,8 @@ func (s *Service) convertTx(
 	}
 	txHashRaw := string(txHashBytes)
 
+	cdc := app.MakeEncodingConfig().Marshaler
+
 	// Extract fees
 	feeTx, ok := tx.(sdk.FeeTx)
 	var feeAmounts []int64
@@ -104,9 +106,9 @@ func (s *Service) convertTx(
 	var taxDenomIDs []uint16
 
 	for _, event := range res.Events {
-		if event.Type == "tax" || event.Type == "treasury" {
+		if event.Type == "tax_payment" {
 			for _, attr := range event.Attributes {
-				if string(attr.Key) == "amount" || string(attr.Key) == "tax" {
+				if string(attr.Key) == "tax_amount" {
 					coins, err := sdk.ParseCoinsNormalized(string(attr.Value))
 					if err == nil {
 						for _, coin := range coins {
@@ -120,11 +122,21 @@ func (s *Service) convertTx(
 		}
 	}
 
+	// Fallback to legacy calculation if no tax_payment event found
+	if len(taxAmounts) == 0 && s.tax != nil {
+		calculatedTax, err := s.tax.CalculateTax(context.Background(), int64(height), tx, cdc)
+		if err == nil {
+			for _, coin := range calculatedTax {
+				taxAmounts = append(taxAmounts, coin.Amount.Int64())
+				denomID, _ := s.dims.GetOrCreateDenomID(context.Background(), coin.Denom)
+				taxDenomIDs = append(taxDenomIDs, denomID)
+			}
+		}
+	}
+
 	// Extract Msgs
 	var msgTypeIDs []uint16
 	var msgsJSON []string
-
-	cdc := app.MakeEncodingConfig().Marshaler
 
 	for _, msg := range tx.GetMsgs() {
 		msgType := proto.MessageName(msg)

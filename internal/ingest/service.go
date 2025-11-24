@@ -35,6 +35,7 @@ type Service struct {
 
 	dims *Dimensions
 	rich *RichlistService
+	tax  *TaxCalculator
 
 	// gRPC connection
 	grpcConn *grpc.ClientConn
@@ -95,6 +96,7 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		grpcConn:          grpcConn,
 		dims:              NewDimensions(pg),
 		rich:              NewRichlistService(pg, clientCtx, richlistInterval),
+		tax:               NewTaxCalculator(grpcConn),
 		blockPollInterval: blockPollInterval,
 		backfillInterval:  backfillInterval,
 		backfillBatchSize: backfillBatchSize,
