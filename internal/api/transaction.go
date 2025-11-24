@@ -278,7 +278,11 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	}
 
 	// Fetch Proposer Info (Validator)
-	valMap, _ := s.getValidatorMap(context.Background())
+	valMap, err := s.getValidatorMap(context.Background())
+	if err != nil {
+		// Log error
+		fmt.Printf("Failed to get validator map: %v\n", err)
+	}
 	var proposer map[string]string
 	if valMap != nil {
 		if p, ok := valMap[block.ProposerAddress]; ok {
