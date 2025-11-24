@@ -87,10 +87,11 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 		// Fetch price 24h ago (approximate using last price before 24h ago)
 		var price24hAgo float64
 		// We use argMax to get the price at the latest timestamp before 24h ago
+		// Restrict lookback to avoid picking up ancient prices (e.g. pre-crash)
 		err = s.ch.Conn.QueryRow(context.Background(), `
 			SELECT price 
 			FROM oracle_prices 
-			WHERE denom = ? AND block_time <= now() - INTERVAL 24 HOUR
+			WHERE denom = ? AND block_time <= now() - INTERVAL 24 HOUR AND block_time >= now() - INTERVAL 48 HOUR
 			ORDER BY block_time DESC 
 			LIMIT 1
 		`, denom).Scan(&price24hAgo)
@@ -215,7 +216,7 @@ func (s *Server) GetMarketSwapRate(w http.ResponseWriter, r *http.Request) {
 		sql := `
 			SELECT denom, argMax(price, block_time) as price
 			FROM oracle_prices
-			WHERE block_time <= now() - INTERVAL 24 HOUR
+			WHERE block_time <= now() - INTERVAL 24 HOUR AND block_time >= now() - INTERVAL 48 HOUR
 			GROUP BY denom
 		`
 		_ = s.ch.Conn.Select(context.Background(), &rows, sql)

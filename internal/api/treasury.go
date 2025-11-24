@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"math/big"
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -135,9 +135,9 @@ func (s *Server) GetTotalSupply(w http.ResponseWriter, r *http.Request) {
 	if denom != "" {
 		for _, coin := range supply {
 			if coin.Denom == denom {
-				// FCD returns number
-				f, _ := strconv.ParseFloat(coin.Amount.String(), 64)
-				respondJSON(w, http.StatusOK, f)
+				// FCD returns number (unquoted)
+				// Use json.RawMessage to avoid float64 precision loss and quotes
+				respondJSON(w, http.StatusOK, json.RawMessage(coin.Amount.String()))
 				return
 			}
 		}
@@ -198,23 +198,23 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Helper to find amount in list and convert to big.Int
-	findAmount := func(coins sdk.Coins, d string) *big.Int {
+	// Helper to find amount in list and convert to sdk.Dec
+	findAmount := func(coins sdk.Coins, d string) sdk.Dec {
 		for _, c := range coins {
 			if c.Denom == d {
-				return c.Amount.BigInt()
+				return sdk.NewDecFromInt(c.Amount)
 			}
 		}
-		return big.NewInt(0)
+		return sdk.ZeroDec()
 	}
 
-	findPoolAmount := func(coins sdk.DecCoins, d string) *big.Int {
+	findPoolAmount := func(coins sdk.DecCoins, d string) sdk.Dec {
 		for _, c := range coins {
 			if c.Denom == d {
-				return c.Amount.TruncateInt().BigInt()
+				return c.Amount
 			}
 		}
-		return big.NewInt(0)
+		return sdk.ZeroDec()
 	}
 
 	if denom != "" {
@@ -222,16 +222,14 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 		poolAmount := findPoolAmount(pool, denom)
 		excludedAmount := findAmount(excludedCoins, denom)
 
-		circulating := new(big.Int).Sub(totalSupply, poolAmount)
-		circulating.Sub(circulating, excludedAmount)
+		circulating := totalSupply.Sub(poolAmount).Sub(excludedAmount)
 
-		if circulating.Sign() < 0 {
-			circulating = big.NewInt(0)
+		if circulating.IsNegative() {
+			circulating = sdk.ZeroDec()
 		}
 
 		// FCD returns number
-		f, _ := new(big.Float).SetInt(circulating).Float64()
-		respondJSON(w, http.StatusOK, f)
+		respondJSON(w, http.StatusOK, json.RawMessage(circulating.String()))
 		return
 	}
 
@@ -239,19 +237,17 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 	for _, sCoin := range supply {
 		poolAmount := findPoolAmount(pool, sCoin.Denom)
 		excludedAmount := findAmount(excludedCoins, sCoin.Denom)
-		totalSupply := sCoin.Amount.BigInt()
+		totalSupply := sdk.NewDecFromInt(sCoin.Amount)
 
-		circulating := new(big.Int).Sub(totalSupply, poolAmount)
-		circulating.Sub(circulating, excludedAmount)
+		circulating := totalSupply.Sub(poolAmount).Sub(excludedAmount)
 
-		if circulating.Sign() < 0 {
-			circulating = big.NewInt(0)
+		if circulating.IsNegative() {
+			circulating = sdk.ZeroDec()
 		}
 
-		f, _ := new(big.Float).SetInt(circulating).Float64()
 		result = append(result, map[string]interface{}{
 			"denom":  sCoin.Denom,
-			"amount": f,
+			"amount": json.RawMessage(circulating.String()),
 		})
 	}
 

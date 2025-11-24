@@ -76,7 +76,7 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 	taxStr := strings.Join(taxParts, ",")
 
 	// Convert Fees (Subtract Tax from Fee to get Gas Fee)
-	var feeCoins []FCDCoin
+	feeCoins := []FCDCoin{}
 	for i, amount := range tx.FeeAmounts {
 		denomID := tx.FeeDenomIDs[i]
 		denom, ok := denoms[denomID]
@@ -133,15 +133,38 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 	}
 
 	// Convert Signatures
-	var signatures []interface{}
+	signatures := []interface{}{}
 	for _, sigJSON := range tx.SignaturesJSON {
 		var sigMap map[string]interface{}
 		if err := json.Unmarshal([]byte(sigJSON), &sigMap); err == nil {
-			// Transform pub_key from Amino {"type":..., "value":...} to FCD {"key":...}
-			if pk, ok := sigMap["pub_key"].(map[string]interface{}); ok {
-				if val, ok := pk["value"].(string); ok {
-					sigMap["pub_key"] = map[string]string{
-						"key": val,
+			// Fix pub_key format
+			if pubKey, ok := sigMap["pub_key"].(map[string]interface{}); ok {
+				// Check if we have "key" but missing "value"
+				if key, hasKey := pubKey["key"].(string); hasKey {
+					if _, hasValue := pubKey["value"]; !hasValue {
+						// We need to transform it
+						newPubKey := map[string]interface{}{
+							"value": key,
+						}
+
+						// Determine type
+						if typeURL, ok := pubKey["@type"].(string); ok {
+							switch typeURL {
+							case "/cosmos.crypto.secp256k1.PubKey":
+								newPubKey["type"] = "tendermint/PubKeySecp256k1"
+							case "/cosmos.crypto.ed25519.PubKey":
+								newPubKey["type"] = "tendermint/PubKeyEd25519"
+							case "/cosmos.crypto.multisig.LegacyAminoPubKey":
+								newPubKey["type"] = "tendermint/PubKeyMultisigThreshold"
+							default:
+								newPubKey["type"] = "tendermint/PubKeySecp256k1" // Fallback
+							}
+						} else {
+							// Default if no type
+							newPubKey["type"] = "tendermint/PubKeySecp256k1"
+						}
+
+						sigMap["pub_key"] = newPubKey
 					}
 				}
 			}

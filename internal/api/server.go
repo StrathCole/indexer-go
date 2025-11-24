@@ -1,12 +1,16 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/classic-terra/core/v3/app"
 	"github.com/classic-terra/indexer-go/internal/db"
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	tmtypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/gorilla/mux"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -40,6 +44,7 @@ func (s *Server) Router() http.Handler {
 
 	// Middleware
 	r.Use(loggingMiddleware)
+	r.Use(recoveryMiddleware)
 	r.Use(s.corsMiddleware)
 
 	// Routes
@@ -61,6 +66,7 @@ func (s *Server) Router() http.Handler {
 	v1.HandleFunc("/txs/gas_prices", s.GetGasPrices).Methods("GET")
 	v1.HandleFunc("/txs", s.GetTxs).Methods("GET")
 	v1.HandleFunc("/txs/{hash}", s.GetTx).Methods("GET")
+	v1.HandleFunc("/tx/{hash}", s.GetTx).Methods("GET") // Alias
 	v1.HandleFunc("/mempool", s.GetMempool).Methods("GET")
 	v1.HandleFunc("/mempool/{hash}", s.GetMempoolTx).Methods("GET")
 
@@ -107,6 +113,18 @@ func (s *Server) Router() http.Handler {
 func (s *Server) GetRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"name":"Terra Classic Indexer API","version":"1.0.0","status":"online"}`))
+}
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Error().Msgf("Panic recovered: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
@@ -156,4 +174,118 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) GetGasPrices(w http.ResponseWriter, r *http.Request) {
+	// Hardcoded gas prices from Classic FCD
+	gasPrices := map[string]string{
+		"uaud":  "0.95",
+		"ucad":  "0.95",
+		"uchf":  "0.7",
+		"ucny":  "4.9",
+		"udkk":  "4.5",
+		"ueur":  "0.625",
+		"ugbp":  "0.55",
+		"uhkd":  "5.85",
+		"uidr":  "10900.0",
+		"uinr":  "54.4",
+		"ujpy":  "81.85",
+		"ukrw":  "850.0",
+		"uluna": "28.325",
+		"umnt":  "2142.855",
+		"umyr":  "3.0",
+		"unok":  "6.25",
+		"uphp":  "38.0",
+		"usdr":  "0.52469",
+		"usek":  "6.25",
+		"usgd":  "1.0",
+		"uthb":  "23.1",
+		"utwd":  "20.0",
+		"uusd":  "0.75",
+	}
+
+	respondJSON(w, http.StatusOK, gasPrices)
+}
+
+func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	res, err := s.rpc.UnconfirmedTxs(context.Background(), &limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to fetch mempool")
+		return
+	}
+
+	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
+	txEncoder := app.MakeEncodingConfig().TxConfig.TxJSONEncoder()
+
+	var decodedTxs []interface{}
+	for _, txBytes := range res.Txs {
+		tx, err := txDecoder(txBytes)
+		if err == nil {
+			// Marshal to JSON
+			jsonBytes, err := txEncoder(tx)
+			if err == nil {
+				var txObj interface{}
+				json.Unmarshal(jsonBytes, &txObj)
+
+				decodedTxs = append(decodedTxs, map[string]interface{}{
+					"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+					"chainId":   "columbus-5",
+					"txhash":    fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash()),
+					"tx":        txObj,
+				})
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"total": res.Total,
+		"txs":   decodedTxs,
+	})
+}
+
+func (s *Server) GetMempoolTx(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	hash := vars["hash"]
+
+	// Fetch all (up to limit) and search
+	limit := 1000
+	res, err := s.rpc.UnconfirmedTxs(context.Background(), &limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to fetch mempool")
+		return
+	}
+
+	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
+	txEncoder := app.MakeEncodingConfig().TxConfig.TxJSONEncoder()
+
+	for _, txBytes := range res.Txs {
+		// Calculate hash
+		currentHash := fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash())
+		if currentHash == hash {
+			tx, err := txDecoder(txBytes)
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, "Failed to decode tx")
+				return
+			}
+			jsonBytes, err := txEncoder(tx)
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, "Failed to marshal tx")
+				return
+			}
+
+			var txObj interface{}
+			json.Unmarshal(jsonBytes, &txObj)
+
+			respondJSON(w, http.StatusOK, map[string]interface{}{
+				"timestamp": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+				"chainId":   "columbus-5",
+				"txhash":    currentHash,
+				"tx":        txObj,
+			})
+			return
+		}
+	}
+
+	respondError(w, http.StatusNotFound, "Transaction not found in mempool")
 }

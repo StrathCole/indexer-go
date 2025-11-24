@@ -246,56 +246,76 @@ func (s *Server) enrichValidatorsParallel(ctx context.Context, validators []stak
 	return enriched, nil
 }
 
-func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
-	s.respondWithCache(w, "validators", 1*time.Minute, func() (interface{}, error) {
-		stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
-		ctx := context.Background()
-
-		// Pagination loop
-		var allValidators []stakingtypes.Validator
-		var nextKey []byte
-
-		for {
-			req := &stakingtypes.QueryValidatorsRequest{
-				Pagination: &query.PageRequest{
-					Key:   nextKey,
-					Limit: 100,
-				},
-			}
-			resp, err := stakingClient.Validators(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-			allValidators = append(allValidators, resp.Validators...)
-			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
-				break
-			}
-			nextKey = resp.Pagination.NextKey
+func (s *Server) getCachedValidators(ctx context.Context) ([]EnrichedValidator, error) {
+	key := "all_validators_struct"
+	if val, found := s.cache.Get(key); found {
+		if validators, ok := val.([]EnrichedValidator); ok {
+			return validators, nil
 		}
+	}
 
-		poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
-		var totalBonded float64
-		if err == nil {
-			fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
+	// Fetch logic
+	stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
+
+	// Pagination loop
+	var allValidators []stakingtypes.Validator
+	var nextKey []byte
+
+	for {
+		req := &stakingtypes.QueryValidatorsRequest{
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: 100,
+			},
 		}
-
-		// Fetch Oracle Prices
-		oracleClient := oracletypes.NewQueryClient(s.clientCtx)
-		priceMap := make(map[string]sdk.Dec)
-		ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
-		if err == nil {
-			for _, r := range ratesResp.ExchangeRates {
-				priceMap[r.Denom] = r.Amount
-			}
+		resp, err := stakingClient.Validators(ctx, req)
+		if err != nil {
+			return nil, err
 		}
+		allValidators = append(allValidators, resp.Validators...)
+		if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
 
-		// Sort by Voting Power (Tokens) Descending
-		sort.Slice(allValidators, func(i, j int) bool {
-			return allValidators[i].Tokens.GT(allValidators[j].Tokens)
-		})
+	poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
+	var totalBonded float64
+	if err == nil {
+		fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
+	}
 
-		return s.enrichValidatorsParallel(ctx, allValidators, totalBonded, priceMap)
+	// Fetch Oracle Prices
+	oracleClient := oracletypes.NewQueryClient(s.clientCtx)
+	priceMap := make(map[string]sdk.Dec)
+	ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
+	if err == nil {
+		for _, r := range ratesResp.ExchangeRates {
+			priceMap[r.Denom] = r.Amount
+		}
+	}
+
+	// Sort by Voting Power (Tokens) Descending
+	sort.Slice(allValidators, func(i, j int) bool {
+		return allValidators[i].Tokens.GT(allValidators[j].Tokens)
 	})
+
+	enriched, err := s.enrichValidatorsParallel(ctx, allValidators, totalBonded, priceMap)
+	if err != nil {
+		return nil, err
+	}
+
+	s.cache.Set(key, enriched, 1*time.Minute)
+	return enriched, nil
+}
+
+func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
+	validators, err := s.getCachedValidators(context.Background())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, validators)
 }
 
 func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
@@ -768,25 +788,12 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 
 		g, ctx := errgroup.WithContext(ctx)
 
-		// 1. Fetch all validators (needed for names)
-		var allValidators []stakingtypes.Validator
+		// 1. Fetch all validators (cached)
+		var enrichedValidators []EnrichedValidator
 		g.Go(func() error {
-			var nextKey []byte
-			for {
-				req := &stakingtypes.QueryValidatorsRequest{
-					Pagination: &query.PageRequest{Key: nextKey, Limit: 100},
-				}
-				resp, err := stakingClient.Validators(ctx, req)
-				if err != nil {
-					return err
-				}
-				allValidators = append(allValidators, resp.Validators...)
-				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
-					break
-				}
-				nextKey = resp.Pagination.NextKey
-			}
-			return nil
+			var err error
+			enrichedValidators, err = s.getCachedValidators(ctx)
+			return err
 		})
 
 		// 2. Fetch Delegations
@@ -859,17 +866,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 
-		// 6. Pool
-		var totalBonded float64
-		g.Go(func() error {
-			poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
-			if err == nil {
-				fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
-			}
-			return nil
-		})
-
-		// 7. Oracle Prices
+		// 6. Oracle Prices (needed for user rewards calculation)
 		priceMapDec := make(map[string]sdk.Dec)
 		g.Go(func() error {
 			ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
@@ -934,15 +931,20 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 			return res
 		}
 
-		// Process Validators
-		enrichedValidators, err := s.enrichValidatorsParallel(ctx, allValidators, totalBonded, priceMapDec)
-		if err != nil {
-			return nil, err
+		// Clone validators to avoid modifying cache
+		validatorsCopy := make([]EnrichedValidator, len(enrichedValidators))
+		for i, v := range enrichedValidators {
+			validatorsCopy[i] = v
+			// Reset user specific fields
+			validatorsCopy[i].MyDelegation = ""
+			validatorsCopy[i].MyDelegatable = ""
+			validatorsCopy[i].MyRewards = nil
+			validatorsCopy[i].MyUndelegation = nil
 		}
 
-		valMap := make(map[string]EnrichedValidator)
-		for _, ev := range enrichedValidators {
-			valMap[ev.OperatorAddress] = ev
+		valMap := make(map[string]*EnrichedValidator)
+		for i := range validatorsCopy {
+			valMap[validatorsCopy[i].OperatorAddress] = &validatorsCopy[i]
 		}
 
 		// My Delegations
@@ -981,9 +983,10 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Enrich validators with my delegation info
-		for i, v := range enrichedValidators {
+		for i := range validatorsCopy {
+			v := &validatorsCopy[i]
 			if amt, ok := delegationMap[v.OperatorAddress]; ok {
-				enrichedValidators[i].MyDelegation = amt
+				v.MyDelegation = amt
 			}
 			// Add undelegations if any
 			for _, u := range unbondings {
@@ -998,7 +1001,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 							"creationHeight":   entry.CreationHeight,
 						})
 					}
-					enrichedValidators[i].MyUndelegation = myUnbondings
+					v.MyUndelegation = myUnbondings
 				}
 			}
 		}
@@ -1047,7 +1050,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		}
 
 		return map[string]interface{}{
-			"validators":      enrichedValidators,
+			"validators":      validatorsCopy,
 			"delegationTotal": fmt.Sprintf("%.0f", delegationTotal),
 			"availableLuna":   availableLuna,
 			"undelegations":   undelegationsFlat,

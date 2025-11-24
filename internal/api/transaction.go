@@ -3,17 +3,13 @@ package api
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/classic-terra/core/v3/app"
-	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
 	"github.com/classic-terra/indexer-go/internal/model"
-	tmtypes "github.com/cometbft/cometbft/types"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
@@ -432,129 +428,11 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	response := map[string]interface{}{
 		"chainId":   "columbus-5", // Hardcoded
 		"height":    block.Height,
-		"timestamp": block.BlockTime.Format(time.RFC3339),
+		"timestamp": block.BlockTime.UTC().Format("2006-01-02T15:04:05.000Z"),
 		"proposer":  proposer,
 		"txs":       fcdTxs,
 		"events":    blockEvents,
 	}
 
 	respondJSON(w, http.StatusOK, response)
-}
-
-func (s *Server) GetGasPrices(w http.ResponseWriter, r *http.Request) {
-	// Fetch oracle exchange rates
-	oracleClient := oracletypes.NewQueryClient(s.clientCtx)
-	resp, err := oracleClient.ExchangeRates(context.Background(), &oracletypes.QueryExchangeRatesRequest{})
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "Failed to fetch gas prices")
-		return
-	}
-
-	// Convert to map[string]string
-	gasPrices := make(map[string]string)
-	for _, rate := range resp.ExchangeRates {
-		gasPrices[rate.Denom] = rate.Amount.String()
-	}
-
-	// Add native denom (uluna)
-	// FCD returns uluna price? Usually gas prices are defined in params or config.
-	// FCD uses config.MIN_GAS_PRICES.
-	// We should probably use a config value too.
-	// For now, hardcode or use what we have.
-	if _, ok := gasPrices["uluna"]; !ok {
-		gasPrices["uluna"] = "0.01133"
-	}
-
-	respondJSON(w, http.StatusOK, gasPrices)
-}
-
-func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	res, err := s.rpc.UnconfirmedTxs(context.Background(), &limit)
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "Failed to fetch mempool")
-		return
-	}
-
-	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
-	txEncoder := app.MakeEncodingConfig().TxConfig.TxJSONEncoder()
-
-	var decodedTxs []interface{}
-	for _, txBytes := range res.Txs {
-		tx, err := txDecoder(txBytes)
-		if err == nil {
-			// Marshal to JSON
-			jsonBytes, err := txEncoder(tx)
-			if err == nil {
-				// We need to wrap it in FCD structure: { timestamp, txhash, tx: { type, value... } }
-				// But txEncoder returns just the tx value usually?
-				// No, it returns the standard Cosmos JSON tx.
-				// FCD expects:
-				// {
-				//   "timestamp": "...",
-				//   "txhash": "...",
-				//   "tx": { ... }
-				// }
-
-				var txObj interface{}
-				json.Unmarshal(jsonBytes, &txObj)
-
-				decodedTxs = append(decodedTxs, map[string]interface{}{
-					"timestamp": time.Now().Format(time.RFC3339), // Approx
-					"txhash":    fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash()),
-					"tx":        txObj,
-				})
-			}
-		}
-	}
-
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"total": res.Total,
-		"txs":   decodedTxs,
-	})
-}
-
-func (s *Server) GetMempoolTx(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	hash := vars["hash"]
-
-	// Fetch all (up to limit) and search
-	limit := 1000
-	res, err := s.rpc.UnconfirmedTxs(context.Background(), &limit)
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "Failed to fetch mempool")
-		return
-	}
-
-	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
-	txEncoder := app.MakeEncodingConfig().TxConfig.TxJSONEncoder()
-
-	for _, txBytes := range res.Txs {
-		// Calculate hash
-		currentHash := fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash())
-		if currentHash == hash {
-			tx, err := txDecoder(txBytes)
-			if err != nil {
-				respondError(w, http.StatusInternalServerError, "Failed to decode tx")
-				return
-			}
-			jsonBytes, err := txEncoder(tx)
-			if err != nil {
-				respondError(w, http.StatusInternalServerError, "Failed to marshal tx")
-				return
-			}
-
-			var txObj interface{}
-			json.Unmarshal(jsonBytes, &txObj)
-
-			respondJSON(w, http.StatusOK, map[string]interface{}{
-				"timestamp": time.Now().Format(time.RFC3339),
-				"txhash":    currentHash,
-				"tx":        txObj,
-			})
-			return
-		}
-	}
-
-	respondError(w, http.StatusNotFound, "Transaction not found in mempool")
 }
