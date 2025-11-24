@@ -97,6 +97,14 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 		StakingReturn:   "0", // Stub
 		AccountAddress:  accAddr,
 	}
+
+	// Format DelegatorShares to 10 decimals to match FCD
+	if idx := strings.Index(ev.DelegatorShares, "."); idx != -1 {
+		if len(ev.DelegatorShares) > idx+11 {
+			ev.DelegatorShares = ev.DelegatorShares[:idx+11]
+		}
+	}
+
 	ev.RewardsPool.Total = "0"
 	ev.RewardsPool.Denoms = []interface{}{}
 
@@ -214,7 +222,7 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 		})
 		if err == nil && delResp.DelegationResponse != nil {
 			amountStr := delResp.DelegationResponse.Balance.Amount.String()
-			ev.SelfDelegation.Amount = amountStr
+			ev.SelfDelegation.Amount = amountStr + ".0000000000"
 
 			amount, _ := strconv.ParseFloat(amountStr, 64)
 			if tokens > 0 {

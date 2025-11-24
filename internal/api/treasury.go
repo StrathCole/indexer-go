@@ -16,15 +16,17 @@ import (
 func (s *Server) GetTaxProceeds(w http.ResponseWriter, r *http.Request) {
 	// Query ClickHouse for tax logs
 	type TaxProceed struct {
-		Denom string `json:"denom"`
-		Total string `json:"amount"`
+		Denom          string `json:"denom" ch:"denom"`
+		Total          string `json:"amount" ch:"amount"`
+		AdjustedAmount string `json:"adjustedAmount" ch:"adjustedAmount"`
 	}
 
 	var proceeds []TaxProceed
 	sql := `
 SELECT 
 extract(attr_value, '([a-z]+)') as denom,
-toString(sum(cast(extract(attr_value, '(\\d+)') as Int64))) as total
+toString(sum(cast(extract(attr_value, '(\\d+)') as UInt64))) as amount,
+toString(sum(cast(extract(attr_value, '(\\d+)') as UInt64))) as adjustedAmount
 FROM events 
 WHERE event_type = 'tax' AND attr_key = 'amount'
 GROUP BY denom
@@ -40,8 +42,8 @@ GROUP BY denom
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"total":        "0",
-		"tax_proceeds": proceeds,
+		"total":       "0",
+		"taxProceeds": proceeds,
 	})
 }
 

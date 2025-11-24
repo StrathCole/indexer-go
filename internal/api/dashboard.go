@@ -119,20 +119,19 @@ func (s *Server) GetDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	taxRate := taxRateResp.TaxRate.String()
+	// Format taxRate to match FCD (remove trailing zeros)
+	if strings.Contains(taxRate, ".") {
+		taxRate = strings.TrimRight(taxRate, "0")
+		taxRate = strings.TrimRight(taxRate, ".")
+	}
 
 	communityPool := make(map[string]string)
 	for _, c := range communityPoolResp.Pool {
 		communityPool[c.Denom] = c.Amount.String()
 	}
 
-	bonded := stakingPoolResp.Pool.BondedTokens.String()
-	if strings.Contains(bonded, ".") {
-		bonded = strings.Split(bonded, ".")[0]
-	}
-	notBonded := stakingPoolResp.Pool.NotBondedTokens.String()
-	if strings.Contains(notBonded, ".") {
-		notBonded = strings.Split(notBonded, ".")[0]
-	}
+	bonded := stakingPoolResp.Pool.BondedTokens.String() + ".0000000000"
+	notBonded := stakingPoolResp.Pool.NotBondedTokens.String() + ".0000000000"
 
 	type TaxCapResponse struct {
 		Denom  string `json:"denom"`
@@ -161,7 +160,7 @@ func (s *Server) GetDashboard(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(bonded, "%f", &b)
 		fmt.Sscanf(issuanceMap["uluna"], "%f", &t)
 		if t > 0 {
-			stakingRatio = fmt.Sprintf("%.15f", b/t)
+			stakingRatio = fmt.Sprintf("%.17f", b/t)
 		}
 	}
 
@@ -301,7 +300,7 @@ func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 		sql := `
 			SELECT 
 				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
-				toString(sum(cast(extract(reward_str, '^\\d+') as UInt64))) as blockReward 
+				toString(sum(cast(extract(reward_str, '^[\\d\\.]+') as Decimal(38, 10)))) as blockReward 
 			FROM (
 				SELECT 
 					block_time,
@@ -309,7 +308,7 @@ func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 				FROM events 
 				WHERE event_type = 'rewards' AND attr_key = 'amount'
 			)
-			WHERE replaceRegexpOne(reward_str, '^\\d+', '') = 'ukrw'
+			WHERE replaceRegexpOne(reward_str, '^[\\d\\.]+', '') = 'ukrw'
 			GROUP BY datetime 
 			ORDER BY datetime ASC
 		`
@@ -323,15 +322,15 @@ func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 
 		// Calculate cumulative
 		var cumulative []Reward
-		runningTotal := big.NewInt(0)
+		runningTotal := new(big.Float)
 
 		for _, r := range rewards {
-			amount := new(big.Int)
-			amount.SetString(r.BlockReward, 10)
+			amount := new(big.Float)
+			amount.SetString(r.BlockReward)
 			runningTotal.Add(runningTotal, amount)
 			cumulative = append(cumulative, Reward{
 				Time:        r.Time,
-				BlockReward: runningTotal.String(),
+				BlockReward: runningTotal.Text('f', 10),
 			})
 		}
 
@@ -365,7 +364,7 @@ func (s *Server) GetSeigniorageProceeds(w http.ResponseWriter, r *http.Request) 
 		sql := `
 		 SELECT 
 				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
-				toString(sum(cast(extract(attr_value, '(\\d+)') as UInt64))) as seigniorageProceeds 
+				toString(sum(cast(extract(attr_value, '^[\\d\\.]+') as Decimal(38, 10)))) as seigniorageProceeds 
 			FROM events 
 			WHERE event_type = 'seigniorage_proceeds' AND attr_key = 'amount'
 			GROUP BY datetime 
@@ -547,6 +546,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 		var periodic []Growth
 		var cumulative []Growth
 		var total uint64 = 0
+		var cumulativeActive uint64 = 0
 
 		// We need to align dates.
 		// Iterate newAccs as base for total growth.
@@ -588,6 +588,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 		for _, n := range newAccs {
 			total += n.Count
 			act := activeMap[n.Time]
+			cumulativeActive += act
 
 			periodic = append(periodic, Growth{
 				Time:   n.Time,
@@ -598,7 +599,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 			cumulative = append(cumulative, Growth{
 				Time:   n.Time,
 				Count:  total,
-				Active: act,
+				Active: cumulativeActive,
 			})
 		}
 
