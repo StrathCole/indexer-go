@@ -147,7 +147,7 @@ func main() {
 
 	// 2. Iterate Txs
 	// We iterate by height to be efficient
-	startHeight := int64(0)
+	startHeight := int64(4724780)
 	batchSize := 1000
 
 	log.Println("Starting tax backfill...")
@@ -191,7 +191,7 @@ func main() {
 
 			// Debug log for first few
 			if i < 5 && len(calculatedTax) > 0 {
-				log.Printf("Tx %s: Calculated Tax: %v", tx.TxHash, calculatedTax)
+				log.Printf("Tx %X: Calculated Tax: %v", tx.TxHash, calculatedTax)
 			}
 
 			if len(calculatedTax) > 0 {

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -60,7 +59,7 @@ type FCDLog struct {
 // MapTxToFCD converts our internal model.Tx to FCDTxResponse
 func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse {
 	// Convert Hash
-	txHash := strings.ToUpper(hex.EncodeToString([]byte(tx.TxHash)))
+	txHash := tx.TxHash
 
 	// Convert Tax
 	var taxParts []string

@@ -274,5 +274,21 @@ func (tc *TaxCalculator) fetchTaxRateGRPC(ctx context.Context, method string) (s
 	if err != nil {
 		return sdk.Dec{}, err
 	}
-	return sdk.NewDecFromStr(out.TaxRate)
+	// log.Printf("Raw Tax Rate: %s", out.TaxRate)
+	dec, err := sdk.NewDecFromStr(out.TaxRate)
+	if err != nil {
+		return sdk.Dec{}, err
+	}
+
+	// Heuristic: If tax rate is > 1, it's likely an unscaled integer (10^18)
+	// Tax rate should be small (e.g. 0.005).
+	if dec.GT(sdk.OneDec()) {
+		// Divide by 10^18
+		precision := sdk.NewDecFromIntWithPrec(sdk.OneInt(), 18) // 10^-18
+		// Wait, NewDecFromIntWithPrec(1, 18) is 0.000...01
+		// We want to multiply by 10^-18
+		dec = dec.Mul(precision)
+	}
+
+	return dec, nil
 }
