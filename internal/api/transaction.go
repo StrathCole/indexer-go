@@ -19,7 +19,7 @@ import (
 
 func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
-	account := query.Get("account")
+	account := strings.TrimSpace(query.Get("account"))
 	block := query.Get("block")
 	limitStr := query.Get("limit")
 	offsetStr := query.Get("offset")
@@ -48,7 +48,12 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		// Get address ID
 		var addressID uint64
 		err = s.pg.Pool.QueryRow(context.Background(), "SELECT id FROM addresses WHERE address = $1", account).Scan(&addressID)
+
+		// Debug headers
+		w.Header().Set("X-Debug-Address-ID", fmt.Sprintf("%d", addressID))
+
 		if err != nil {
+			w.Header().Set("X-Debug-Error", err.Error())
 			// Address not found, return empty list
 			respondJSON(w, http.StatusOK, map[string]interface{}{
 				"txs": []model.Tx{},
@@ -78,6 +83,7 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		args = append(args, limit)
 
 		err = s.ch.Conn.Select(context.Background(), &txs, sql, args...)
+		w.Header().Set("X-Debug-Rows-Found", fmt.Sprintf("%d", len(txs)))
 
 	} else if block != "" {
 		height, err := strconv.ParseUint(block, 10, 64)
