@@ -70,7 +70,25 @@ func main() {
 			creds = insecure.NewCredentials()
 		}
 
-		grpcConn, err = grpc.Dial(target, grpc.WithTransportCredentials(creds))
+		dialOpts := []grpc.DialOption{
+			grpc.WithTransportCredentials(creds),
+		}
+
+		// If path is present, use it as a prefix for method calls (path-based routing)
+		if len(u.Path) > 0 && u.Path != "/" {
+			pathPrefix := u.Path
+			if !strings.HasPrefix(pathPrefix, "/") {
+				pathPrefix = "/" + pathPrefix
+			}
+			pathPrefix = strings.TrimSuffix(pathPrefix, "/")
+
+			interceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				return invoker(ctx, pathPrefix+method, req, reply, cc, opts...)
+			}
+			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(interceptor))
+		}
+
+		grpcConn, err = grpc.Dial(target, dialOpts...)
 		if err != nil {
 			log.Fatalf("Failed to dial gRPC: %v", err)
 		}
