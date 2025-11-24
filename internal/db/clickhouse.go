@@ -130,20 +130,20 @@ func (ch *ClickHouse) FindNextGap(ctx context.Context, startHeight, endHeight in
 		return startHeight, nil
 	}
 
-	// 2. Find the first gap using neighbor function (lag with OVER is not always supported/enabled)
-	// We look for a jump in heights > 1
+	// 2. Find the first gap using array functions (robust across CH versions)
+	// We collect heights in range, sort them, calculate differences, and find the first diff > 1
 	query := `
-		SELECT prev_height + 1
+		SELECT arrayElement(sorted_heights, i-1) + 1
 		FROM (
 			SELECT 
-				height, 
-				neighbor(height, -1) as prev_height
-			FROM blocks
-			WHERE height >= $1 AND height < $2
-			ORDER BY height ASC
+				arraySort(groupArray(height)) as sorted_heights,
+				arrayDifference(sorted_heights) as diffs,
+				arrayFirstIndex(x -> x > 1, diffs) as i
+			FROM (
+				SELECT height FROM blocks WHERE height >= $1 AND height < $2
+			)
 		)
-		WHERE prev_height >= $1 AND height - prev_height > 1
-		LIMIT 1
+		WHERE i > 0
 	`
 
 	rows, err := ch.Conn.Query(ctx, query, startHeight, endHeight)
