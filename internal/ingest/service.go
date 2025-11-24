@@ -74,11 +74,21 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		}
 
 		target := u.Host
+		if !strings.Contains(target, ":") {
+			if u.Scheme == "https" {
+				target = target + ":443"
+			} else {
+				target = target + ":80"
+			}
+		}
+
 		secure := u.Scheme == "https" || strings.HasSuffix(target, ":443")
 
 		var creds credentials.TransportCredentials
 		if secure {
-			creds = credentials.NewTLS(&tls.Config{})
+			creds = credentials.NewTLS(&tls.Config{
+				ServerName: u.Hostname(),
+			})
 		} else {
 			creds = insecure.NewCredentials()
 		}
@@ -100,6 +110,9 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 			}
 			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(interceptor))
 		}
+
+		// Force authority to match hostname (without port) to satisfy strict Nginx/Cloudflare checks
+		dialOpts = append(dialOpts, grpc.WithAuthority(u.Hostname()))
 
 		grpcConn, err = grpc.Dial(target, dialOpts...)
 		if err != nil {

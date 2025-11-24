@@ -61,11 +61,21 @@ func main() {
 		}
 
 		target := u.Host
+		if !strings.Contains(target, ":") {
+			if u.Scheme == "https" {
+				target = target + ":443"
+			} else {
+				target = target + ":80"
+			}
+		}
+
 		secure := u.Scheme == "https" || strings.HasSuffix(target, ":443")
 
 		var creds credentials.TransportCredentials
 		if secure {
-			creds = credentials.NewTLS(&tls.Config{})
+			creds = credentials.NewTLS(&tls.Config{
+				ServerName: u.Hostname(),
+			})
 		} else {
 			creds = insecure.NewCredentials()
 		}
@@ -83,10 +93,14 @@ func main() {
 			pathPrefix = strings.TrimSuffix(pathPrefix, "/")
 
 			interceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-				return invoker(ctx, pathPrefix+method, req, reply, cc, opts...)
+				newMethod := pathPrefix + method
+				return invoker(ctx, newMethod, req, reply, cc, opts...)
 			}
 			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(interceptor))
 		}
+
+		// Force authority to match hostname (without port) to satisfy strict Nginx/Cloudflare checks
+		dialOpts = append(dialOpts, grpc.WithAuthority(u.Hostname()))
 
 		grpcConn, err = grpc.Dial(target, dialOpts...)
 		if err != nil {
