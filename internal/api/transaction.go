@@ -38,9 +38,9 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	offset := 0
+	offset := uint64(0)
 	if offsetStr != "" {
-		if o, err := strconv.Atoi(offsetStr); err == nil {
+		if o, err := strconv.ParseUint(offsetStr, 10, 64); err == nil {
 			offset = o
 		}
 	}
@@ -60,24 +60,28 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Query account_txs
-		// We need to join with txs to get full details.
-		// ClickHouse SQL:
-		// SELECT t.* FROM txs t
-		// INNER JOIN account_txs a ON t.height = a.height AND t.index_in_block = a.index_in_block
-		// WHERE a.address_id = ?
-		// ORDER BY t.height DESC, t.index_in_block DESC
-		// LIMIT ? OFFSET ?
+		var args []interface{}
+		whereClause := "a.address_id = ?"
+		args = append(args, addressID)
 
-		sql := `
+		if offset > 0 {
+			height := offset / 100000
+			index := offset % 100000
+			whereClause += " AND (t.height < ? OR (t.height = ? AND t.index_in_block < ?))"
+			args = append(args, height, height, index)
+		}
+
+		sql := fmt.Sprintf(`
 			SELECT t.* 
 			FROM txs t
 			INNER JOIN account_txs a ON t.height = a.height AND t.index_in_block = a.index_in_block AND t.tx_hash = a.tx_hash
-			WHERE a.address_id = ?
+			WHERE %s
 			ORDER BY t.height DESC, t.index_in_block DESC
-			LIMIT ? OFFSET ?
-		`
-		err = s.ch.Conn.Select(context.Background(), &txs, sql, addressID, limit, offset)
+			LIMIT ?
+		`, whereClause)
+		args = append(args, limit)
+
+		err = s.ch.Conn.Select(context.Background(), &txs, sql, args...)
 
 	} else if block != "" {
 		height, err := strconv.ParseUint(block, 10, 64)
@@ -86,21 +90,48 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sql := `
+		var args []interface{}
+		whereClause := "height = ?"
+		args = append(args, height)
+
+		if offset > 0 {
+			oHeight := offset / 100000
+			oIndex := offset % 100000
+			if oHeight == height {
+				whereClause += " AND index_in_block > ?"
+				args = append(args, oIndex)
+			}
+		}
+
+		sql := fmt.Sprintf(`
 			SELECT * FROM txs 
-			WHERE height = ? 
+			WHERE %s
 			ORDER BY index_in_block ASC 
-			LIMIT ? OFFSET ?
-		`
-		err = s.ch.Conn.Select(context.Background(), &txs, sql, height, limit, offset)
+			LIMIT ?
+		`, whereClause)
+		args = append(args, limit)
+
+		err = s.ch.Conn.Select(context.Background(), &txs, sql, args...)
 
 	} else {
-		sql := `
+		var args []interface{}
+		whereClause := "1=1"
+		if offset > 0 {
+			height := offset / 100000
+			index := offset % 100000
+			whereClause = "(height < ? OR (height = ? AND index_in_block < ?))"
+			args = append(args, height, height, index)
+		}
+
+		sql := fmt.Sprintf(`
 			SELECT * FROM txs 
+			WHERE %s
 			ORDER BY height DESC, index_in_block DESC 
-			LIMIT ? OFFSET ?
-		`
-		err = s.ch.Conn.Select(context.Background(), &txs, sql, limit, offset)
+			LIMIT ?
+		`, whereClause)
+		args = append(args, limit)
+
+		err = s.ch.Conn.Select(context.Background(), &txs, sql, args...)
 	}
 
 	if err != nil {
@@ -116,16 +147,27 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		denoms = make(map[uint16]string)
 	}
 
+	// Fetch MsgTypes
+	msgTypes, err := s.getMsgTypes(context.Background())
+	if err != nil {
+		msgTypes = make(map[uint16]string)
+	}
+
 	// Map to FCD format
 	var fcdTxs []FCDTxResponse
 	for _, tx := range txs {
-		fcdTxs = append(fcdTxs, s.MapTxToFCD(tx, denoms))
+		fcdTxs = append(fcdTxs, s.MapTxToFCD(tx, denoms, msgTypes))
+	}
+
+	var next uint64
+	if len(fcdTxs) > 0 {
+		next = fcdTxs[len(fcdTxs)-1].ID
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"txs":   fcdTxs,
 		"limit": limit,
-		"next":  offset + limit, // Simple pagination
+		"next":  next,
 	})
 }
 
@@ -153,7 +195,13 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 		denoms = make(map[uint16]string)
 	}
 
-	respondJSON(w, http.StatusOK, s.MapTxToFCD(tx, denoms))
+	// Fetch MsgTypes
+	msgTypes, err := s.getMsgTypes(context.Background())
+	if err != nil {
+		msgTypes = make(map[uint16]string)
+	}
+
+	respondJSON(w, http.StatusOK, s.MapTxToFCD(tx, denoms, msgTypes))
 }
 
 func (s *Server) getDenoms(ctx context.Context) (map[uint16]string, error) {
@@ -173,6 +221,25 @@ func (s *Server) getDenoms(ctx context.Context) (map[uint16]string, error) {
 		}
 	}
 	return denoms, nil
+}
+
+func (s *Server) getMsgTypes(ctx context.Context) (map[uint16]string, error) {
+	// TODO: Cache this
+	rows, err := s.pg.Pool.Query(ctx, "SELECT id, msg_type FROM msg_types")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	msgTypes := make(map[uint16]string)
+	for rows.Next() {
+		var id uint16
+		var msgType string
+		if err := rows.Scan(&id, &msgType); err == nil {
+			msgTypes[id] = msgType
+		}
+	}
+	return msgTypes, nil
 }
 
 func (s *Server) getValidatorMap(ctx context.Context) (map[string]map[string]string, error) {
@@ -268,10 +335,16 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		denoms = make(map[uint16]string)
 	}
 
+	// Fetch MsgTypes
+	msgTypes, _ := s.getMsgTypes(context.Background())
+	if msgTypes == nil {
+		msgTypes = make(map[uint16]string)
+	}
+
 	// Map Txs
 	var fcdTxs []FCDTxResponse
 	for _, tx := range txs {
-		fcdTxs = append(fcdTxs, s.MapTxToFCD(tx, denoms))
+		fcdTxs = append(fcdTxs, s.MapTxToFCD(tx, denoms, msgTypes))
 	}
 	if fcdTxs == nil {
 		fcdTxs = []FCDTxResponse{}

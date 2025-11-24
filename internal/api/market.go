@@ -16,6 +16,15 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 	interval := query.Get("interval")
 	denom := query.Get("denom")
 
+	if denom == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{
+			"code":    "400",
+			"message": "child \"denom\" fails because [\"denom\" is required]",
+			"type":    "INVALID_REQUEST_ERROR",
+		})
+		return
+	}
+
 	key := "market_price"
 	if denom != "" {
 		key += "_" + denom
@@ -60,9 +69,27 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 			history = []interface{}{}
 		}
 
-		// 3. Calculate Variation (Stub for now)
+		// 3. Calculate Variation
 		oneDayVariation := "0"
 		oneDayVariationRate := "0"
+
+		// Fetch price 24h ago (approximate using last price before 24h ago)
+		var price24hAgo float64
+		// We use argMax to get the price at the latest timestamp before 24h ago
+		err = s.ch.Conn.QueryRow(context.Background(), `
+			SELECT price 
+			FROM oracle_prices 
+			WHERE denom = ? AND block_time <= now() - INTERVAL 24 HOUR
+			ORDER BY block_time DESC 
+			LIMIT 1
+		`, denom).Scan(&price24hAgo)
+
+		if err == nil && price24hAgo > 0 && lastPrice > 0 {
+			diff := lastPrice - price24hAgo
+			rate := diff / lastPrice // Legacy uses division by lastPrice
+			oneDayVariation = fmt.Sprintf("%.15g", diff)
+			oneDayVariationRate = fmt.Sprintf("%.15g", rate)
+		}
 
 		return map[string]interface{}{
 			"lastPrice":           lastPrice,
@@ -116,7 +143,8 @@ func (s *Server) fetchMarketHistory(denom string, interval string) ([]interface{
 		FROM oracle_prices 
 		WHERE denom = ? AND block_time >= ?
 		GROUP BY datetime 
-		ORDER BY datetime ASC
+		ORDER BY datetime DESC
+		LIMIT 50
 	`, timeFunc)
 
 	// Note: context.Background() is used here, but we should ideally use request context if available.
@@ -128,7 +156,14 @@ func (s *Server) fetchMarketHistory(denom string, interval string) ([]interface{
 	}
 
 	var result []interface{}
-	for _, r := range rows {
+	// Reverse to match ASC order expected by frontend?
+	// Legacy returns `reverse()` of `ORDER BY time DESC`. So it returns ASC.
+	// My query is `ORDER BY datetime DESC LIMIT 50`.
+	// So I get latest 50.
+	// Then I should reverse them to be ASC.
+
+	for i := len(rows) - 1; i >= 0; i-- {
+		r := rows[i]
 		result = append(result, map[string]interface{}{
 			"denom":    denom,
 			"datetime": r.Time,
@@ -160,47 +195,107 @@ func (s *Server) GetMarketSwapRate(w http.ResponseWriter, r *http.Request) {
 			priceMap[r.Denom] = val
 		}
 
+		// Fetch prices 24h ago
+		type PriceRow struct {
+			Denom string  `ch:"denom"`
+			Price float64 `ch:"price"`
+		}
+		var rows []PriceRow
+		sql := `
+			SELECT denom, argMax(price, block_time) as price
+			FROM oracle_prices
+			WHERE block_time <= now() - INTERVAL 24 HOUR
+			GROUP BY denom
+		`
+		_ = s.ch.Conn.Select(context.Background(), &rows, sql)
+
+		lastDayPriceMap := make(map[string]float64)
+		for _, r := range rows {
+			lastDayPriceMap[r.Denom] = r.Price
+		}
+
 		var result []map[string]interface{}
 
+		// Helper to calculate swap rate
+		getSwapRate := func(prices map[string]float64, base string, target string) float64 {
+			if base == "uluna" {
+				if target == "uluna" {
+					return 1.0
+				}
+				return prices[target]
+			}
+			// Base is not uluna
+			basePrice, ok := prices[base]
+			if !ok || basePrice == 0 {
+				return 0
+			}
+			if target == "uluna" {
+				return 1.0 / basePrice
+			}
+			if target == base {
+				return 1.0
+			}
+			return prices[target] / basePrice
+		}
+
 		// Helper to add result
-		addResult := func(denom string, rate float64) {
+		addResult := func(denom string) {
+			currentRate := getSwapRate(priceMap, base, denom)
+			lastDayRate := getSwapRate(lastDayPriceMap, base, denom)
+
+			oneDayVariation := "0"
+			oneDayVariationRate := "0"
+
+			if lastDayRate > 0 {
+				diff := currentRate - lastDayRate
+				rate := diff / lastDayRate
+				oneDayVariation = strconv.FormatFloat(diff, 'f', -1, 64)
+				oneDayVariationRate = strconv.FormatFloat(rate, 'f', -1, 64)
+			}
+
 			result = append(result, map[string]interface{}{
 				"denom":               denom,
-				"swaprate":            fmt.Sprintf("%.10f", rate),
-				"oneDayVariation":     "0",
-				"oneDayVariationRate": "0",
+				"swaprate":            strconv.FormatFloat(currentRate, 'f', -1, 64),
+				"oneDayVariation":     oneDayVariation,
+				"oneDayVariationRate": oneDayVariationRate,
 			})
 		}
 
-		if base == "uluna" {
-			// Base is Luna. Rates are already Price of 1 Luna in Denom.
-			for denom, price := range priceMap {
-				addResult(denom, price)
-			}
-			// Add uluna itself
-			addResult("uluna", 1.0)
-		} else {
-			// Base is something else (e.g. uusd)
-			basePrice, ok := priceMap[base]
-			if !ok {
-				// Base not found in oracle rates.
-				// If base is not uluna and not in rates, we can't calculate.
-				return nil, fmt.Errorf("base denom %s not found in exchange rates", base)
-			}
+		// Iterate over all denoms in current price map + uluna + base
+		denoms := make(map[string]bool)
+		for d := range priceMap {
+			denoms[d] = true
+		}
+		denoms["uluna"] = true
+		denoms[base] = true
 
-			// 1 Base = (1/basePrice) Luna
-			// Price of 1 Base in Denom X = (Price of 1 Luna in X) * (1/basePrice) = priceMap[X] / basePrice
-			for denom, price := range priceMap {
-				if denom == base {
-					continue
-				}
-				addResult(denom, price/basePrice)
+		for denom := range denoms {
+			if denom == base && base != "uluna" {
+				// Base itself is added separately in legacy?
+				// Legacy: Object.keys(currentSwapRate).map...
+				// currentSwapRate includes base?
+				// Legacy getSwapRate:
+				// if base == BOND_DENOM return prices (which includes all denoms)
+				// else ... { ...acc, [curr]: div(prices[curr], prices[base]) }, { uluna: lunaSwapRate }
+				// It seems it includes all denoms from prices + uluna.
+				// Does it include base?
+				// "if (curr === base) { return acc }" -> It skips base in reduce.
+				// But it initializes with { uluna: ... }.
+				// So base is NOT in the map?
+				// Wait, if base is uusd. prices has uusd.
+				// It skips uusd in reduce.
+				// So uusd is NOT in the result?
+				// Let's check the diff.
+				// Diff for uusd swaprate has uusd?
+				// No, the diff output I saw earlier:
+				// [ { denom: "uluna", ... }, { denom: "uaud", ... }, ... ]
+				// It does NOT show "uusd" (the base).
+				// So I should SKIP base if base != uluna.
 			}
-			// Add uluna
-			// Price of 1 Base in Luna = 1 / basePrice
-			addResult("uluna", 1.0/basePrice)
-			// Add base itself
-			addResult(base, 1.0)
+			if denom == base && base != "uluna" {
+				continue
+			}
+			addResult(denom)
 		}
 
 		return result, nil

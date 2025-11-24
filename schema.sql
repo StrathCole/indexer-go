@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS txs (
     tax_denom_ids   Array(UInt16),
     msg_type_ids    Array(UInt16),
     msgs_json       Array(String),
+    signatures_json Array(String),
     memo            String,
     -- Additional fields for FCD compatibility
     raw_log         String, -- or compressed

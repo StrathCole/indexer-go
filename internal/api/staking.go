@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
 	"github.com/cosmos/cosmos-sdk/types/query"
@@ -52,28 +54,52 @@ type EnrichedValidator struct {
 		Amount string `json:"amount"`
 		Weight string `json:"weight"`
 	} `json:"selfDelegation"`
+	// For GetValidator (Detail)
+	Commissions []interface{} `json:"commissions,omitempty"`
 	// For GetStakingAccount
 	MyDelegation   string        `json:"myDelegation,omitempty"`
 	MyUndelegation []interface{} `json:"myUndelegation,omitempty"`
 }
 
-func (s *Server) enrichValidator(v stakingtypes.Validator, totalBonded float64) EnrichedValidator {
+func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, totalBonded float64) EnrichedValidator {
+	// Convert Operator Address to Account Address
+	accAddr := ""
+	hrp, data, err := bech32.DecodeAndConvert(v.OperatorAddress)
+	if err == nil {
+		// terravaloper -> terra
+		// Assuming hrp is terravaloper, we want terra
+		// But we should be careful.
+		// Standard cosmos: cosmosvaloper -> cosmos
+		// Terra: terravaloper -> terra
+		accHrp := strings.TrimSuffix(hrp, "valoper")
+		accAddr, _ = bech32.ConvertAndEncode(accHrp, data)
+	}
+
 	ev := EnrichedValidator{
 		OperatorAddress: v.OperatorAddress,
-		// ConsensusPubkey: v.ConsensusPubkey, // LCD doesn't return this in simple view? Check struct.
 		Tokens:          v.Tokens.String(),
 		DelegatorShares: v.DelegatorShares.String(),
 		Status:          v.Status.String(),
-		UpTime:          1.0,               // Stub
-		StakingReturn:   "0",               // Stub
-		AccountAddress:  v.OperatorAddress, // Should convert bech32 valoper -> acc
+		UpTime:          1.0, // Stub
+		StakingReturn:   "0", // Stub
+		AccountAddress:  accAddr,
+	}
+
+	// Consensus Pubkey
+	if v.ConsensusPubkey != nil {
+		// We want the bech32 encoded pubkey? Or the JSON representation?
+		// Legacy FCD returns: "terravalconspub..."
+		// We need to unpack and encode.
+		// For now, let's leave it empty or try to stringify.
+		// v.ConsensusPubkey.String() returns proto string.
+		// Let's try to get the cached value if available.
 	}
 
 	ev.Description.Moniker = v.Description.Moniker
 	ev.Description.Identity = v.Description.Identity
 	ev.Description.Website = v.Description.Website
 	ev.Description.Details = v.Description.Details
-	ev.Description.ProfileIcon = "" // Need external service for this usually
+	ev.Description.ProfileIcon = ""
 
 	ev.CommissionInfo.Rate = v.Commission.CommissionRates.Rate.String()
 	ev.CommissionInfo.MaxRate = v.Commission.CommissionRates.MaxRate.String()
@@ -89,9 +115,31 @@ func (s *Server) enrichValidator(v stakingtypes.Validator, totalBonded float64) 
 		ev.VotingPower.Weight = "0"
 	}
 
-	// Stubs
+	// Rewards Pool
+	// Fetch outstanding rewards
+	distrClient := distrtypes.NewQueryClient(s.clientCtx)
+	rewardsResp, err := distrClient.ValidatorOutstandingRewards(ctx, &distrtypes.QueryValidatorOutstandingRewardsRequest{
+		ValidatorAddress: v.OperatorAddress,
+	})
+
 	ev.RewardsPool.Total = "0"
 	ev.RewardsPool.Denoms = []interface{}{}
+
+	if err == nil {
+		// Calculate total in some unit? Or just list denoms?
+		// Legacy returns "total": "0" (string) and "denoms": [ {denom, amount, adjustedAmount} ]
+		// adjustedAmount seems to be same as amount in diff.
+		var denoms []interface{}
+		for _, r := range rewardsResp.Rewards.Rewards {
+			denoms = append(denoms, map[string]string{
+				"denom":          r.Denom,
+				"amount":         r.Amount.String(),
+				"adjustedAmount": r.Amount.String(),
+			})
+		}
+		ev.RewardsPool.Denoms = denoms
+	}
+
 	ev.SelfDelegation.Amount = "0"
 	ev.SelfDelegation.Weight = "0"
 
@@ -101,6 +149,7 @@ func (s *Server) enrichValidator(v stakingtypes.Validator, totalBonded float64) 
 func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "validators", 1*time.Minute, func() (interface{}, error) {
 		stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
+		ctx := context.Background()
 
 		// Pagination loop
 		var allValidators []stakingtypes.Validator
@@ -113,7 +162,7 @@ func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 					Limit: 100,
 				},
 			}
-			resp, err := stakingClient.Validators(context.Background(), req)
+			resp, err := stakingClient.Validators(ctx, req)
 			if err != nil {
 				return nil, err
 			}
@@ -124,7 +173,7 @@ func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 			nextKey = resp.Pagination.NextKey
 		}
 
-		poolResp, err := stakingClient.Pool(context.Background(), &stakingtypes.QueryPoolRequest{})
+		poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
 		var totalBonded float64
 		if err == nil {
 			fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
@@ -132,7 +181,7 @@ func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 
 		var enriched []EnrichedValidator
 		for _, v := range allValidators {
-			enriched = append(enriched, s.enrichValidator(v, totalBonded))
+			enriched = append(enriched, s.enrichValidator(ctx, v, totalBonded))
 		}
 		return enriched, nil
 	})
@@ -150,9 +199,10 @@ func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
 
 	s.respondWithCache(w, key, 1*time.Minute, func() (interface{}, error) {
 		stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
+		ctx := context.Background()
 
 		// 1. Get Validator
-		valResp, err := stakingClient.Validator(context.Background(), &stakingtypes.QueryValidatorRequest{
+		valResp, err := stakingClient.Validator(ctx, &stakingtypes.QueryValidatorRequest{
 			ValidatorAddr: operatorAddr,
 		})
 		if err != nil {
@@ -161,17 +211,33 @@ func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
 		validator := valResp.Validator
 
 		// 2. Get Pool
-		poolResp, err := stakingClient.Pool(context.Background(), &stakingtypes.QueryPoolRequest{})
+		poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
 		var totalBonded float64
 		if err == nil {
 			fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
 		}
 
-		ev := s.enrichValidator(validator, totalBonded)
+		ev := s.enrichValidator(ctx, validator, totalBonded)
+
+		// 3. Get Commissions (Detail only)
+		distrClient := distrtypes.NewQueryClient(s.clientCtx)
+		commResp, err := distrClient.ValidatorCommission(ctx, &distrtypes.QueryValidatorCommissionRequest{
+			ValidatorAddress: operatorAddr,
+		})
+		if err == nil {
+			var commissions []interface{}
+			for _, c := range commResp.Commission.Commission {
+				commissions = append(commissions, map[string]string{
+					"denom":  c.Denom,
+					"amount": c.Amount.String(),
+				})
+			}
+			ev.Commissions = commissions
+		}
 
 		if accountAddr != "" {
-			// 3. Get Delegation
-			delResp, err := stakingClient.Delegation(context.Background(), &stakingtypes.QueryDelegationRequest{
+			// 4. Get Delegation
+			delResp, err := stakingClient.Delegation(ctx, &stakingtypes.QueryDelegationRequest{
 				DelegatorAddr: accountAddr,
 				ValidatorAddr: operatorAddr,
 			})
@@ -254,11 +320,24 @@ func (s *Server) GetClaims(w http.ResponseWriter, r *http.Request) {
 		return id
 	}
 
-	commissionID := getMsgTypeID("cosmos.distribution.v1beta1.MsgWithdrawValidatorCommission")
-	rewardID := getMsgTypeID("cosmos.distribution.v1beta1.MsgWithdrawDelegationReward")
+	commissionIDs := []uint16{}
+	if id := getMsgTypeID("cosmos.distribution.v1beta1.MsgWithdrawValidatorCommission"); id > 0 {
+		commissionIDs = append(commissionIDs, id)
+	}
+	if id := getMsgTypeID("distribution/MsgWithdrawValidatorCommission"); id > 0 {
+		commissionIDs = append(commissionIDs, id)
+	}
 
-	// If both are 0, we have no such messages indexed yet
-	if commissionID == 0 && rewardID == 0 {
+	rewardIDs := []uint16{}
+	if id := getMsgTypeID("cosmos.distribution.v1beta1.MsgWithdrawDelegationReward"); id > 0 {
+		rewardIDs = append(rewardIDs, id)
+	}
+	if id := getMsgTypeID("distribution/MsgWithdrawDelegationReward"); id > 0 {
+		rewardIDs = append(rewardIDs, id)
+	}
+
+	// If both are empty, we have no such messages indexed yet
+	if len(commissionIDs) == 0 && len(rewardIDs) == 0 {
 		respondJSON(w, http.StatusOK, map[string]interface{}{
 			"claims": []interface{}{},
 			"limit":  limit,
@@ -278,10 +357,10 @@ func (s *Server) GetClaims(w http.ResponseWriter, r *http.Request) {
 		WHERE 
 			code = 0 AND (
 				(
-					has(msg_type_ids, ?) AND 
+					hasAny(msg_type_ids, ?) AND 
 					(arrayExists(x -> JSONExtractString(x, 'validator_address') = ?, msgs_json) OR arrayExists(x -> JSONExtractString(x, 'validatorAddress') = ?, msgs_json))
 				) OR (
-					has(msg_type_ids, ?) AND 
+					hasAny(msg_type_ids, ?) AND 
 					(arrayExists(x -> JSONExtractString(x, 'validator_address') = ?, msgs_json) OR arrayExists(x -> JSONExtractString(x, 'validatorAddress') = ?, msgs_json)) AND
 					(arrayExists(x -> JSONExtractString(x, 'delegator_address') = ?, msgs_json) OR arrayExists(x -> JSONExtractString(x, 'delegatorAddress') = ?, msgs_json))
 				)
@@ -299,8 +378,8 @@ func (s *Server) GetClaims(w http.ResponseWriter, r *http.Request) {
 
 	var rows []TxRow
 	err = s.ch.Conn.Select(context.Background(), &rows, sql,
-		commissionID, operatorAddr, operatorAddr,
-		rewardID, operatorAddr, operatorAddr, accountAddr, accountAddr,
+		commissionIDs, operatorAddr, operatorAddr,
+		rewardIDs, operatorAddr, operatorAddr, accountAddr, accountAddr,
 		limit, offset,
 	)
 	if err != nil {
@@ -362,7 +441,7 @@ func (s *Server) GetClaims(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			var amounts []interface{}
+			var amounts []map[string]string
 			parseAmounts := func(amtStr string) {
 				parts := strings.Split(amtStr, ",")
 				for _, part := range parts {
@@ -399,11 +478,40 @@ func (s *Server) GetClaims(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if len(amounts) > 0 {
+				// Sort amounts
+				sort.Slice(amounts, func(i, j int) bool {
+					denomOrder := map[string]int{
+						"uluna": 0,
+						"ukrw":  1,
+						"usdr":  2,
+						"uusd":  3,
+					}
+					d1 := amounts[i]["denom"]
+					d2 := amounts[j]["denom"]
+					o1, ok1 := denomOrder[d1]
+					o2, ok2 := denomOrder[d2]
+					if ok1 && ok2 {
+						return o1 < o2
+					}
+					if ok1 {
+						return true
+					}
+					if ok2 {
+						return false
+					}
+					return d1 < d2
+				})
+
+				var amountsIf []interface{}
+				for _, a := range amounts {
+					amountsIf = append(amountsIf, a)
+				}
+
 				claims = append(claims, Claim{
 					ChainID:   chainID,
 					TxHash:    row.TxHash,
 					Type:      claimType,
-					Amounts:   amounts,
+					Amounts:   amountsIf,
 					Timestamp: time.Unix(row.Timestamp, 0).Format(time.RFC3339),
 				})
 			}
@@ -429,6 +537,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
 		distrClient := distrtypes.NewQueryClient(s.clientCtx)
 		bankClient := banktypes.NewQueryClient(s.clientCtx)
+		oracleClient := oracletypes.NewQueryClient(s.clientCtx)
 		ctx := context.Background()
 
 		// 1. Fetch all validators (needed for names)
@@ -508,11 +617,69 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 			fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
 		}
 
+		// 7. Oracle Prices
+		priceMapDec := make(map[string]sdk.Dec)
+		ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
+		if err == nil {
+			for _, r := range ratesResp.ExchangeRates {
+				priceMapDec[r.Denom] = r.Amount
+			}
+		}
+
+		// Helper to calculate total rewards in Luna
+		getTotalRewardsAdjustedToLuna := func(rewards sdk.DecCoins) string {
+			total := sdk.ZeroDec()
+			for _, r := range rewards {
+				if r.Denom == "uluna" {
+					total = total.Add(r.Amount)
+				} else {
+					if price, ok := priceMapDec[r.Denom]; ok && !price.IsZero() {
+						total = total.Add(r.Amount.Quo(price))
+					}
+				}
+			}
+			return total.String()
+		}
+
+		// Helper to sort rewards
+		sortDecCoins := func(coins sdk.DecCoins) []map[string]string {
+			var res []map[string]string
+			for _, c := range coins {
+				res = append(res, map[string]string{
+					"denom":  c.Denom,
+					"amount": c.Amount.String(),
+				})
+			}
+			sort.Slice(res, func(i, j int) bool {
+				denomOrder := map[string]int{
+					"uluna": 0,
+					"ukrw":  1,
+					"usdr":  2,
+					"uusd":  3,
+				}
+				d1 := res[i]["denom"]
+				d2 := res[j]["denom"]
+				o1, ok1 := denomOrder[d1]
+				o2, ok2 := denomOrder[d2]
+				if ok1 && ok2 {
+					return o1 < o2
+				}
+				if ok1 {
+					return true
+				}
+				if ok2 {
+					return false
+				}
+				return d1 < d2
+			})
+			return res
+		}
+
 		// Process Validators
 		valMap := make(map[string]EnrichedValidator)
 		var enrichedValidators []EnrichedValidator
 		for _, v := range allValidators {
-			ev := s.enrichValidator(v, totalBonded)
+			ev := s.enrichValidator(ctx, v, totalBonded)
 			valMap[v.OperatorAddress] = ev
 			enrichedValidators = append(enrichedValidators, ev)
 		}
@@ -547,8 +714,8 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 				"validatorName":    valName,
 				"validatorAddress": d.Delegation.ValidatorAddress,
 				"amountDelegated":  d.Balance.Amount.String(),
-				"rewards":          valReward,
-				"totalReward":      "0",
+				"rewards":          sortDecCoins(valReward),
+				"totalReward":      getTotalRewardsAdjustedToLuna(valReward),
 			})
 		}
 
@@ -586,7 +753,13 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 
 		// Rewards Total
 		rewardsTotal := "0"
-		// rewardsResp.Total is sdk.DecCoins
+		var rewardsDenoms []map[string]string
+		if rewardsResp != nil {
+			rewardsTotal = getTotalRewardsAdjustedToLuna(rewardsResp.Total)
+			rewardsDenoms = sortDecCoins(rewardsResp.Total)
+		} else {
+			rewardsDenoms = []map[string]string{}
+		}
 
 		// Undelegations flat list
 		var undelegationsFlat []interface{}
@@ -620,16 +793,16 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 			"myDelegations":   myDelegations,
 			"rewards": map[string]interface{}{
 				"total":  rewardsTotal,
-				"denoms": rewardsResp.Total,
+				"denoms": rewardsDenoms,
 			},
 		}, nil
 	})
 }
 
 func (s *Server) GetTotalStakingReturn(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, "0")
+	respondJSON(w, http.StatusOK, 0)
 }
 
 func (s *Server) GetValidatorReturn(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, "0")
+	respondJSON(w, http.StatusOK, 0)
 }

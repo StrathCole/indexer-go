@@ -15,28 +15,6 @@ func (s *Service) BatchInsert(
 	accountTxs []model.AccountTx,
 	oraclePrices []model.OraclePrice,
 ) error {
-	if len(blocks) > 0 {
-		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO blocks")
-		if err != nil {
-			return fmt.Errorf("failed to prepare blocks batch: %w", err)
-		}
-		for _, b := range blocks {
-			err := batch.Append(
-				b.Height,
-				b.BlockHash,
-				b.BlockTime,
-				b.ProposerAddress,
-				b.TxCount,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to append block: %w", err)
-			}
-		}
-		if err := batch.Send(); err != nil {
-			return fmt.Errorf("failed to send blocks batch: %w", err)
-		}
-	}
-
 	if len(txs) > 0 {
 		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO txs")
 		if err != nil {
@@ -58,6 +36,7 @@ func (s *Service) BatchInsert(
 				t.TaxDenomIDs,
 				t.MsgTypeIDs,
 				t.MsgsJSON,
+				t.SignaturesJSON,
 				t.Memo,
 				t.RawLog,
 				t.LogsJSON,
@@ -141,6 +120,28 @@ func (s *Service) BatchInsert(
 		}
 		if err := batch.Send(); err != nil {
 			return fmt.Errorf("failed to send oracle_prices batch: %w", err)
+		}
+	}
+
+	if len(blocks) > 0 {
+		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO blocks")
+		if err != nil {
+			return fmt.Errorf("failed to prepare blocks batch: %w", err)
+		}
+		for _, b := range blocks {
+			err := batch.Append(
+				b.Height,
+				b.BlockHash,
+				b.BlockTime,
+				b.ProposerAddress,
+				b.TxCount,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to append block: %w", err)
+			}
+		}
+		if err := batch.Send(); err != nil {
+			return fmt.Errorf("failed to send blocks batch: %w", err)
 		}
 	}
 

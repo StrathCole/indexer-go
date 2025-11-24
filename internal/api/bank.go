@@ -31,7 +31,8 @@ func (s *Server) GetBalances(w http.ResponseWriter, r *http.Request) {
 	var delegations []stakingtypes.DelegationResponse
 	if err == nil {
 		delegations = delResp.DelegationResponses
-	} else {
+	}
+	if delegations == nil {
 		delegations = []stakingtypes.DelegationResponse{}
 	}
 

@@ -29,6 +29,7 @@ type Tx struct {
 	TaxDenomIDs  []uint16  `ch:"tax_denom_ids"`
 	MsgTypeIDs   []uint16  `ch:"msg_type_ids"`
 	MsgsJSON     []string  `ch:"msgs_json"`
+	SignaturesJSON []string `ch:"signatures_json"`
 	Memo         string    `ch:"memo"`
 	RawLog       string    `ch:"raw_log"`
 	LogsJSON     string    `ch:"logs_json"`

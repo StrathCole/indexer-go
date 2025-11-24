@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
-	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cosmos/cosmos-sdk/codec"
+	"github.com/cosmos/cosmos-sdk/types/query"
 
 	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
 	treasurytypes "github.com/classic-terra/core/v3/x/treasury/types"
@@ -77,9 +78,31 @@ func (s *Server) GetDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// 6. Issuances (Optional)
 	g.Go(func() error {
-		err := s.safeQuery(ctx, "/cosmos.bank.v1beta1.Query/TotalSupply", &banktypes.QueryTotalSupplyRequest{}, supplyResp)
-		if err != nil {
-			supplyResp = nil
+		// Fetch all pages
+		supplyResp = &banktypes.QueryTotalSupplyResponse{}
+		var nextKey []byte
+
+		for {
+			req := &banktypes.QueryTotalSupplyRequest{
+				Pagination: &query.PageRequest{
+					Key:        nextKey,
+					Limit:      1000,
+					CountTotal: false,
+				},
+			}
+			var resp banktypes.QueryTotalSupplyResponse
+			err := s.safeQuery(ctx, "/cosmos.bank.v1beta1.Query/TotalSupply", req, &resp)
+			if err != nil {
+				supplyResp = nil
+				return nil
+			}
+
+			supplyResp.Supply = append(supplyResp.Supply, resp.Supply...)
+
+			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+				break
+			}
+			nextKey = resp.Pagination.NextKey
 		}
 		return nil
 	})
@@ -95,7 +118,7 @@ func (s *Server) GetDashboard(w http.ResponseWriter, r *http.Request) {
 		prices[p.Denom] = p.Amount.String()
 	}
 
-	taxRate, _ := strconv.ParseFloat(taxRateResp.TaxRate.String(), 64)
+	taxRate := taxRateResp.TaxRate.String()
 
 	communityPool := make(map[string]string)
 	for _, c := range communityPoolResp.Pool {
@@ -103,7 +126,13 @@ func (s *Server) GetDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bonded := stakingPoolResp.Pool.BondedTokens.String()
+	if strings.Contains(bonded, ".") {
+		bonded = strings.Split(bonded, ".")[0]
+	}
 	notBonded := stakingPoolResp.Pool.NotBondedTokens.String()
+	if strings.Contains(notBonded, ".") {
+		notBonded = strings.Split(notBonded, ".")[0]
+	}
 
 	type TaxCapResponse struct {
 		Denom  string `json:"denom"`
@@ -409,18 +438,38 @@ func (s *Server) GetStakingRatio(w http.ResponseWriter, r *http.Request) {
 		bonded := stakingPoolResp.Pool.BondedTokens.String()
 
 		bankClient := banktypes.NewQueryClient(s.clientCtx)
-		supplyResp, err := bankClient.TotalSupply(context.Background(), &banktypes.QueryTotalSupplyRequest{})
-		if err != nil {
-			return nil, err
-		}
 
-		// Find uluna supply
+		// Fetch all pages for TotalSupply
 		var ulunaSupply string
-		for _, coin := range supplyResp.Supply {
-			if coin.Denom == "uluna" {
-				ulunaSupply = coin.Amount.String()
+		var nextKey []byte
+
+		for {
+			req := &banktypes.QueryTotalSupplyRequest{
+				Pagination: &query.PageRequest{
+					Key:        nextKey,
+					Limit:      1000,
+					CountTotal: false,
+				},
+			}
+			resp, err := bankClient.TotalSupply(context.Background(), req)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, coin := range resp.Supply {
+				if coin.Denom == "uluna" {
+					ulunaSupply = coin.Amount.String()
+					break
+				}
+			}
+			if ulunaSupply != "" {
 				break
 			}
+
+			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+				break
+			}
+			nextKey = resp.Pagination.NextKey
 		}
 
 		stakingRatio := "0"
@@ -452,9 +501,9 @@ func (s *Server) GetStakingRatio(w http.ResponseWriter, r *http.Request) {
 func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "account_growth", 5*time.Minute, func() (interface{}, error) {
 		type Growth struct {
-			Time   uint64 `ch:"datetime"`
-			Count  uint64 `ch:"totalAccount"`
-			Active uint64 `ch:"activeAccount"`
+			Time   uint64 `json:"datetime" ch:"datetime"`
+			Count  uint64 `json:"totalAccountCount" ch:"totalAccount"`
+			Active uint64 `json:"activeAccountCount" ch:"activeAccount"`
 		}
 
 		// Active accounts per day
@@ -570,8 +619,8 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "active_accounts", 5*time.Minute, func() (interface{}, error) {
 		type Active struct {
-			Time  uint64 `ch:"datetime"`
-			Count uint64 `ch:"value"`
+			Time  uint64 `json:"datetime" ch:"datetime"`
+			Count uint64 `json:"value" ch:"value"`
 		}
 
 		var active []Active
@@ -623,8 +672,8 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		type Growth struct {
-			Time  uint64 `ch:"datetime"`
-			Count uint64 `ch:"value"`
+			Time  uint64 `json:"datetime" ch:"datetime"`
+			Count uint64 `json:"value" ch:"value"`
 		}
 		var growth []Growth
 		sql := `

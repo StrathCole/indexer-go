@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	txsigning "github.com/cosmos/cosmos-sdk/types/tx/signing"
+	"github.com/cosmos/cosmos-sdk/x/auth/signing"
 	"github.com/cosmos/gogoproto/proto"
 )
 
@@ -154,6 +157,33 @@ func (s *Service) convertTx(
 		memo = memoTx.GetMemo()
 	}
 
+	// Extract Signatures
+	var signaturesJSON []string
+	if sigTx, ok := tx.(signing.Tx); ok {
+		sigs, err := sigTx.GetSignaturesV2()
+		if err == nil {
+			for _, sig := range sigs {
+				var sigBytes []byte
+				if single, ok := sig.Data.(*txsigning.SingleSignatureData); ok {
+					sigBytes = single.Signature
+				}
+
+				if sigBytes != nil {
+					pubKeyJSON, err := cdc.MarshalJSON(sig.PubKey)
+					if err == nil {
+						sigBase64 := base64.StdEncoding.EncodeToString(sigBytes)
+						sigMap := map[string]interface{}{
+							"pub_key":   json.RawMessage(pubKeyJSON),
+							"signature": sigBase64,
+						}
+						b, _ := json.Marshal(sigMap)
+						signaturesJSON = append(signaturesJSON, string(b))
+					}
+				}
+			}
+		}
+	}
+
 	modelTx := &model.Tx{
 		Height:       height,
 		IndexInBlock: index,
@@ -169,6 +199,7 @@ func (s *Service) convertTx(
 		TaxDenomIDs:  taxDenomIDs,
 		MsgTypeIDs:   msgTypeIDs,
 		MsgsJSON:     msgsJSON,
+		SignaturesJSON: signaturesJSON,
 		Memo:         memo,
 		RawLog:       res.Log,
 		LogsJSON:     res.Log,

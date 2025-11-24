@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/classic-terra/indexer-go/internal/model"
 )
@@ -13,7 +12,6 @@ import (
 // FCDTxResponse mirrors the old FCD transaction response format
 type FCDTxResponse struct {
 	ID        uint64   `json:"id"` // Using Height * 100000 + IndexInBlock as ID
-	ChainID   string   `json:"chainId"`
 	Tx        FCDTx    `json:"tx"`
 	Logs      []FCDLog `json:"logs"`
 	Height    string   `json:"height"`
@@ -57,7 +55,7 @@ type FCDLog struct {
 }
 
 // MapTxToFCD converts our internal model.Tx to FCDTxResponse
-func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse {
+func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[uint16]string) FCDTxResponse {
 	// Convert Hash
 	txHash := tx.TxHash
 
@@ -101,13 +99,25 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 
 	// Convert Msgs
 	var msgs []interface{}
-	for _, msgJSON := range tx.MsgsJSON {
-		var msg interface{}
-		if err := json.Unmarshal([]byte(msgJSON), &msg); err == nil {
-			msgs = append(msgs, msg)
-		} else {
-			msgs = append(msgs, msgJSON) // Fallback
+	for i, msgJSON := range tx.MsgsJSON {
+		var msgContent interface{}
+		if err := json.Unmarshal([]byte(msgJSON), &msgContent); err != nil {
+			msgContent = msgJSON
 		}
+
+		// Get Type
+		typeName := "unknown"
+		if i < len(tx.MsgTypeIDs) {
+			id := tx.MsgTypeIDs[i]
+			if name, ok := msgTypes[id]; ok {
+				typeName = mapProtoToAmino(name)
+			}
+		}
+
+		msgs = append(msgs, map[string]interface{}{
+			"type":  typeName,
+			"value": msgContent,
+		})
 	}
 
 	// Convert Logs
@@ -122,10 +132,18 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 		}
 	}
 
+	// Convert Signatures
+	var signatures []interface{}
+	for _, sigJSON := range tx.SignaturesJSON {
+		var sig interface{}
+		if err := json.Unmarshal([]byte(sigJSON), &sig); err == nil {
+			signatures = append(signatures, sig)
+		}
+	}
+
 	// Construct Response
 	return FCDTxResponse{
-		ID:      tx.Height*100000 + uint64(tx.IndexInBlock), // Synthetic ID
-		ChainID: "columbus-5",                               // Hardcoded for now, or fetch from config
+		ID: tx.Height*100000 + uint64(tx.IndexInBlock), // Synthetic ID
 		Tx: FCDTx{
 			Type: "core/StdTx", // Generic type
 			Value: FCDTxValue{
@@ -135,7 +153,7 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 				},
 				Msg:        msgs,
 				Memo:       tx.Memo,
-				Signatures: []interface{}{}, // Not stored
+				Signatures: signatures,
 				Timeout:    "0",
 				Tax:        taxStr,
 			},
@@ -145,9 +163,25 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 		TxHash:    txHash,
 		RawLog:    tx.RawLog,
 		GasUsed:   strconv.FormatUint(tx.GasUsed, 10),
-		Timestamp: tx.BlockTime.Format(time.RFC3339),
+		Timestamp: tx.BlockTime.Format("2006-01-02T15:04:05.000Z"),
 		GasWanted: strconv.FormatUint(tx.GasWanted, 10),
 		Codespace: tx.Codespace,
 		Code:      int(tx.Code),
 	}
+}
+
+func mapProtoToAmino(protoName string) string {
+	// terra.oracle.v1beta1.MsgAggregateExchangeRatePrevote -> oracle/MsgAggregateExchangeRatePrevote
+	// cosmos.bank.v1beta1.MsgSend -> bank/MsgSend
+
+	parts := strings.Split(protoName, ".")
+	if len(parts) > 2 {
+		// Check for cosmos or terra prefix
+		if parts[0] == "cosmos" || parts[0] == "terra" {
+			// module is parts[1]
+			msgName := parts[len(parts)-1]
+			return fmt.Sprintf("%s/%s", parts[1], msgName)
+		}
+	}
+	return protoName
 }
