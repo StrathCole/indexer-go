@@ -130,14 +130,14 @@ func (ch *ClickHouse) FindNextGap(ctx context.Context, startHeight, endHeight in
 		return startHeight, nil
 	}
 
-	// 2. Find the first gap using window function
+	// 2. Find the first gap using neighbor function (lag with OVER is not always supported/enabled)
 	// We look for a jump in heights > 1
 	query := `
 		SELECT prev_height + 1
 		FROM (
 			SELECT 
 				height, 
-				lag(height, 1, 0) OVER (ORDER BY height ASC) as prev_height
+				neighbor(height, -1) as prev_height
 			FROM blocks
 			WHERE height >= $1 AND height < $2
 			ORDER BY height ASC
