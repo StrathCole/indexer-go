@@ -28,6 +28,8 @@ type Tx struct {
 	GasUsed      uint64    `ch:"gas_used"`
 	FeeAmounts   []int64   `ch:"fee_amounts"`
 	FeeDenomIDs  []uint16  `ch:"fee_denom_ids"`
+	TaxAmounts   []int64   `ch:"tax_amounts"`
+	TaxDenomIDs  []uint16  `ch:"tax_denom_ids"`
 	MsgTypeIDs   []uint16  `ch:"msg_type_ids"`
 	MsgsJSON     []string  `ch:"msgs_json"`
 	Memo         string    `ch:"memo"`

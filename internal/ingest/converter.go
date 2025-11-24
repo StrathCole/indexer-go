@@ -99,6 +99,27 @@ func (s *Service) convertTx(
 		}
 	}
 
+	// Extract Tax
+	var taxAmounts []int64
+	var taxDenomIDs []uint16
+
+	for _, event := range res.Events {
+		if event.Type == "tax" || event.Type == "treasury" {
+			for _, attr := range event.Attributes {
+				if string(attr.Key) == "amount" || string(attr.Key) == "tax" {
+					coins, err := sdk.ParseCoinsNormalized(string(attr.Value))
+					if err == nil {
+						for _, coin := range coins {
+							taxAmounts = append(taxAmounts, coin.Amount.Int64())
+							denomID, _ := s.dims.GetOrCreateDenomID(context.Background(), coin.Denom)
+							taxDenomIDs = append(taxDenomIDs, denomID)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Extract Msgs
 	var msgTypeIDs []uint16
 	var msgsJSON []string
@@ -137,6 +158,8 @@ func (s *Service) convertTx(
 		GasUsed:      uint64(res.GasUsed),
 		FeeAmounts:   feeAmounts,
 		FeeDenomIDs:  feeDenomIDs,
+		TaxAmounts:   taxAmounts,
+		TaxDenomIDs:  taxDenomIDs,
 		MsgTypeIDs:   msgTypeIDs,
 		MsgsJSON:     msgsJSON,
 		Memo:         memo,

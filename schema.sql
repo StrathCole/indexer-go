@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS txs (
     gas_used        UInt64,
     fee_amounts     Array(Int64),
     fee_denom_ids   Array(UInt16),
+    tax_amounts     Array(Int64),
+    tax_denom_ids   Array(UInt16),
     msg_type_ids    Array(UInt16),
     msgs_json       Array(String),
     memo            String,

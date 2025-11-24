@@ -38,6 +38,7 @@ type FCDTxValue struct {
 	Memo       string        `json:"memo"`
 	Signatures []interface{} `json:"signatures"` // We don't store signatures, so empty
 	Timeout    string        `json:"timeout_height"`
+	Tax        string        `json:"tax,omitempty"`
 }
 
 type FCDFee struct {
@@ -61,7 +62,23 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 	// Convert Hash
 	txHash := strings.ToUpper(hex.EncodeToString([]byte(tx.TxHash)))
 
-	// Convert Fees
+	// Convert Tax
+	var taxParts []string
+	taxMap := make(map[string]int64)
+
+	for i, amount := range tx.TaxAmounts {
+		denomID := tx.TaxDenomIDs[i]
+		denom, ok := denoms[denomID]
+		if !ok {
+			denom = fmt.Sprintf("unknown-%d", denomID)
+		}
+		// FCD format: "amountdenom" e.g. "1000uluna"
+		taxParts = append(taxParts, fmt.Sprintf("%d%s", amount, denom))
+		taxMap[denom] = amount
+	}
+	taxStr := strings.Join(taxParts, ",")
+
+	// Convert Fees (Subtract Tax from Fee to get Gas Fee)
 	var feeCoins []FCDCoin
 	for i, amount := range tx.FeeAmounts {
 		denomID := tx.FeeDenomIDs[i]
@@ -69,10 +86,18 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 		if !ok {
 			denom = fmt.Sprintf("unknown-%d", denomID)
 		}
-		feeCoins = append(feeCoins, FCDCoin{
-			Denom:  denom,
-			Amount: strconv.FormatInt(amount, 10),
-		})
+
+		// Subtract tax if present
+		if tax, ok := taxMap[denom]; ok {
+			amount -= tax
+		}
+
+		if amount > 0 {
+			feeCoins = append(feeCoins, FCDCoin{
+				Denom:  denom,
+				Amount: strconv.FormatInt(amount, 10),
+			})
+		}
 	}
 
 	// Convert Msgs
@@ -113,6 +138,7 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string) FCDTxResponse
 				Memo:       tx.Memo,
 				Signatures: []interface{}{}, // Not stored
 				Timeout:    "0",
+				Tax:        taxStr,
 			},
 		},
 		Logs:      logs,
