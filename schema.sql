@@ -38,7 +38,7 @@ ORDER BY (height, index_in_block);
 CREATE TABLE IF NOT EXISTS events (
     height          UInt64,
     block_time      DateTime,
-    scope           Enum8('block' = 0, 'tx' = 1),
+    scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
     tx_index        Int16,                 -- -1 for block-level events
     event_index     UInt16,
     event_type      LowCardinality(String),

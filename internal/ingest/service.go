@@ -150,13 +150,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// Start richlist service
 	go s.rich.Start(ctx)
 
-	// Start RPC client for WebSocket
-	if err := s.rpc.Start(); err != nil {
-		log.Printf("Failed to start RPC client for WebSocket: %v", err)
-		// We continue, as polling will still work
-	} else {
-		defer s.rpc.Stop()
-	}
+	// RPC client lifecycle is managed by startLiveIngest for robustness
 
 	// Start Live Ingestion
 	go s.startLiveIngest(ctx)
@@ -169,44 +163,100 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) startLiveIngest(ctx context.Context) {
-	// Subscribe to NewBlock events
-	var eventCh <-chan coretypes.ResultEvent
-	if s.rpc.IsRunning() {
-		var err error
-		eventCh, err = s.rpc.Subscribe(ctx, "indexer-ingest", "tm.event='NewBlock'")
-		if err != nil {
-			log.Printf("Failed to subscribe to NewBlock events: %v", err)
-		} else {
-			log.Println("Subscribed to NewBlock events via WebSocket")
-		}
-	}
+	// Stall detection timeout (e.g. 60s without a block)
+	stallTimeout := 60 * time.Second
+	timer := time.NewTimer(stallTimeout)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case e := <-eventCh:
-			data, ok := e.Data.(tmtypes.EventDataNewBlock)
-			if !ok {
-				continue
-			}
-			height := data.Block.Height
-			log.Printf("Live Ingest: New block %d", height)
+		default:
+		}
 
-			// Check if exists first
-			exists, err := s.ch.BlockExists(ctx, height)
-			if err != nil {
-				log.Printf("Live Ingest: Failed to check block %d: %v", height, err)
+		// Ensure RPC is running
+		if !s.rpc.IsRunning() {
+			if err := s.rpc.Start(); err != nil {
+				log.Printf("Live Ingest: Failed to start RPC client: %v", err)
+				time.Sleep(5 * time.Second)
 				continue
-			}
-			if exists {
-				continue
-			}
-
-			if err := s.ProcessBlock(height); err != nil {
-				log.Printf("Live Ingest: Failed to process block %d: %v", height, err)
 			}
 		}
+
+		// Subscribe to NewBlock events
+		eventCh, err := s.rpc.Subscribe(ctx, "indexer-ingest", "tm.event='NewBlock'")
+		if err != nil {
+			log.Printf("Live Ingest: Failed to subscribe to NewBlock events: %v", err)
+			// Try to stop and restart
+			s.rpc.Stop()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		log.Println("Live Ingest: Subscribed to NewBlock events via WebSocket")
+
+		// Reset timer
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(stallTimeout)
+
+		reconnect := false
+		for !reconnect {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				log.Printf("Live Ingest: Stalled (no blocks for %v). Reconnecting...", stallTimeout)
+				reconnect = true
+			case e, ok := <-eventCh:
+				if !ok {
+					log.Println("Live Ingest: Event channel closed. Reconnecting...")
+					reconnect = true
+					break
+				}
+
+				// Reset timer on every event (heartbeat)
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(stallTimeout)
+
+				data, ok := e.Data.(tmtypes.EventDataNewBlock)
+				if !ok {
+					continue
+				}
+				height := data.Block.Height
+				log.Printf("Live Ingest: New block %d", height)
+
+				// Check if exists first
+				exists, err := s.ch.BlockExists(ctx, height)
+				if err != nil {
+					log.Printf("Live Ingest: Failed to check block %d: %v", height, err)
+					continue
+				}
+				if exists {
+					continue
+				}
+
+				if err := s.ProcessBlock(height); err != nil {
+					log.Printf("Live Ingest: Failed to process block %d: %v", height, err)
+				}
+			}
+		}
+
+		// Cleanup before reconnecting
+		ctxUnsub, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s.rpc.UnsubscribeAll(ctxUnsub, "indexer-ingest")
+		cancel()
+		s.rpc.Stop()
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -426,11 +476,13 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	beginBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
+		"begin_block",
 		results.BeginBlockEvents,
 	)
 	endBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
+		"end_block",
 		results.EndBlockEvents,
 	)
 

@@ -296,37 +296,78 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		}
 	}
 
-	// Fetch Block Events
+	// Fetch Block Events (BeginBlock, EndBlock, and Tx events)
 	var dbEvents []model.Event
-	sqlEvents := `SELECT * FROM events WHERE height = ? AND scope = 'block' ORDER BY event_index ASC`
+	// Fetch all events for the block
+	sqlEvents := `SELECT * FROM events WHERE height = ? ORDER BY event_index ASC`
 	err = s.ch.Conn.Select(context.Background(), &dbEvents, sqlEvents, block.Height)
 
 	var blockEvents []map[string]interface{}
 	if err == nil && len(dbEvents) > 0 {
-		// Group by EventIndex
-		currentIdx := -1
+		// Bucket events
+		var beginEvents []model.Event
+		var txEvents []model.Event
+		var endEvents []model.Event
+
+		for _, e := range dbEvents {
+			switch e.Scope {
+			case "begin_block", "block":
+				beginEvents = append(beginEvents, e)
+			case "tx":
+				txEvents = append(txEvents, e)
+			case "end_block":
+				endEvents = append(endEvents, e)
+			}
+		}
+
+		// Recombine in order
+		var allEvents []model.Event
+		allEvents = append(allEvents, beginEvents...)
+		allEvents = append(allEvents, txEvents...)
+		allEvents = append(allEvents, endEvents...)
+
+		// Group by (Scope, TxIndex, EventIndex)
 		var currentEvent map[string]interface{}
 		var currentAttrs []map[string]string
 
-		for _, row := range dbEvents {
-			if int(row.EventIndex) != currentIdx {
-				if currentIdx != -1 {
+		// Helper to check if event changed
+		lastScope := ""
+		lastTxIndex := int16(-999)
+		lastEventIndex := uint16(65535)
+
+		for _, row := range allEvents {
+			isNewEvent := false
+			if row.Scope != lastScope || row.TxIndex != lastTxIndex || row.EventIndex != lastEventIndex {
+				isNewEvent = true
+			}
+
+			if isNewEvent {
+				if currentEvent != nil {
 					currentEvent["attributes"] = currentAttrs
 					blockEvents = append(blockEvents, currentEvent)
 				}
-				currentIdx = int(row.EventIndex)
+
 				currentEvent = map[string]interface{}{
-					"type": row.EventType,
+					"type":  row.EventType,
+					"stage": row.Scope,
+				}
+				if row.TxHash != "" {
+					currentEvent["tx_hash"] = row.TxHash
 				}
 				currentAttrs = []map[string]string{}
+
+				lastScope = row.Scope
+				lastTxIndex = row.TxIndex
+				lastEventIndex = row.EventIndex
 			}
+
 			currentAttrs = append(currentAttrs, map[string]string{
 				"key":   row.AttrKey,
 				"value": row.AttrValue,
 			})
 		}
 		// Append last one
-		if currentIdx != -1 {
+		if currentEvent != nil {
 			currentEvent["attributes"] = currentAttrs
 			blockEvents = append(blockEvents, currentEvent)
 		}

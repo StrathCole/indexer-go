@@ -383,6 +383,7 @@ func (s *Service) addAccountTx(
 func (s *Service) convertBlockEvents(
 	height uint64,
 	blockTime time.Time,
+	scope string,
 	events []abcitypes.Event,
 ) []model.Event {
 	var modelEvents []model.Event
@@ -391,7 +392,7 @@ func (s *Service) convertBlockEvents(
 			modelEvents = append(modelEvents, model.Event{
 				Height:     height,
 				BlockTime:  blockTime,
-				Scope:      "block",
+				Scope:      scope,
 				TxIndex:    -1,
 				EventIndex: uint16(i),
 				EventType:  event.Type,

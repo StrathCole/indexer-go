@@ -38,7 +38,7 @@ type Tx struct {
 type Event struct {
 	Height     uint64    `ch:"height"`
 	BlockTime  time.Time `ch:"block_time"`
-	Scope      string    `ch:"scope"` // 'block' or 'tx'
+	Scope      string    `ch:"scope"` // 'block', 'tx', 'begin_block', 'end_block'
 	TxIndex    int16     `ch:"tx_index"`
 	EventIndex uint16    `ch:"event_index"`
 	EventType  string    `ch:"event_type"`
