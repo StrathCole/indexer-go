@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/db"
@@ -349,6 +350,20 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 
 	log.Printf("Backfill: Syncing range %d to %d (FillGaps: %v)", startBlock, endBlock, s.fillGaps)
 
+	var (
+		blocks       []model.Block
+		txs          []model.Tx
+		events       []model.Event
+		accountTxs   []model.AccountTx
+		oraclePrices []model.OraclePrice
+		mu           sync.Mutex
+		wg           sync.WaitGroup
+	)
+
+	// Concurrency limit
+	concurrency := 10
+	sem := make(chan struct{}, concurrency)
+
 	for h := startBlock; h <= endBlock; h++ {
 		// Check if exists (Live ingest might have caught it)
 		exists, err := s.ch.BlockExists(ctx, h)
@@ -360,9 +375,39 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 			continue
 		}
 
-		if err := s.ProcessBlock(h); err != nil {
-			log.Printf("Backfill: Failed to process block %d: %v", h, err)
-			break
+		wg.Add(1)
+		go func(height int64) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			block, results, err := s.fetchBlock(ctx, height)
+			if err != nil {
+				log.Printf("Backfill: Failed to fetch block %d: %v", height, err)
+				return
+			}
+
+			b, t, e, a, o, err := s.processBlockData(block, results)
+			if err != nil {
+				log.Printf("Backfill: Failed to process block %d: %v", height, err)
+				return
+			}
+
+			mu.Lock()
+			blocks = append(blocks, b)
+			txs = append(txs, t...)
+			events = append(events, e...)
+			accountTxs = append(accountTxs, a...)
+			oraclePrices = append(oraclePrices, o...)
+			mu.Unlock()
+		}(h)
+	}
+	wg.Wait()
+
+	if len(blocks) > 0 {
+		err := s.BatchInsert(ctx, blocks, txs, events, accountTxs, oraclePrices)
+		if err != nil {
+			log.Printf("Backfill: Failed to batch insert: %v", err)
 		}
 	}
 
@@ -371,7 +416,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 	return false // Not synced yet
 }
 
-func (s *Service) ProcessBlock(height int64) error {
+func (s *Service) fetchBlock(ctx context.Context, height int64) (*coretypes.ResultBlock, *coretypes.ResultBlockResults, error) {
 	var block *coretypes.ResultBlock
 	var results *coretypes.ResultBlockResults
 	var err error
@@ -382,9 +427,9 @@ func (s *Service) ProcessBlock(height int64) error {
 	retryInterval := 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
-		block, err = s.rpc.Block(context.Background(), &height)
+		block, err = s.rpc.Block(ctx, &height)
 		if err == nil {
-			results, err = s.rpc.BlockResults(context.Background(), &height)
+			results, err = s.rpc.BlockResults(ctx, &height)
 		}
 
 		if err == nil {
@@ -397,14 +442,28 @@ func (s *Service) ProcessBlock(height int64) error {
 	}
 
 	if err != nil {
+		return nil, nil, err
+	}
+	return block, results, nil
+}
+
+func (s *Service) ProcessBlock(height int64) error {
+	block, results, err := s.fetchBlock(context.Background(), height)
+	if err != nil {
 		return err
 	}
 
 	// Process
-	return s.saveBlock(block, results)
+	modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, err := s.processBlockData(block, results)
+	if err != nil {
+		return err
+	}
+
+	// Insert everything in one batch
+	return s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices)
 }
 
-func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.ResultBlockResults) error {
+func (s *Service) processBlockData(block *coretypes.ResultBlock, results *coretypes.ResultBlockResults) (model.Block, []model.Tx, []model.Event, []model.AccountTx, []model.OraclePrice, error) {
 	// Decode transactions
 	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
 
@@ -464,12 +523,5 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		modelAccountTxs = append(modelAccountTxs, accountTxs...)
 	}
 
-	// Insert everything in one batch
-	err := s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices)
-	if err != nil {
-		log.Printf("Failed to insert block/txs: %v", err)
-		return err
-	}
-
-	return nil
+	return modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, nil
 }
