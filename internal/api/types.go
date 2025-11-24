@@ -12,6 +12,7 @@ import (
 // FCDTxResponse mirrors the old FCD transaction response format
 type FCDTxResponse struct {
 	ID        uint64   `json:"id"` // Using Height * 100000 + IndexInBlock as ID
+	ChainID   string   `json:"chainId"`
 	Tx        FCDTx    `json:"tx"`
 	Logs      []FCDLog `json:"logs"`
 	Height    string   `json:"height"`
@@ -50,7 +51,7 @@ type FCDCoin struct {
 
 type FCDLog struct {
 	MsgIndex int           `json:"msg_index"`
-	Log      string        `json:"log"`
+	Log      interface{}   `json:"log"`
 	Events   []interface{} `json:"events"`
 }
 
@@ -174,7 +175,8 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 
 	// Construct Response
 	return FCDTxResponse{
-		ID: tx.Height*100000 + uint64(tx.IndexInBlock), // Synthetic ID
+		ID:      tx.Height*100000 + uint64(tx.IndexInBlock), // Synthetic ID
+		ChainID: "columbus-5",                               // Hardcoded for now
 		Tx: FCDTx{
 			Type: "core/StdTx", // Generic type
 			Value: FCDTxValue{
@@ -194,7 +196,7 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 		TxHash:    txHash,
 		RawLog:    tx.RawLog,
 		GasUsed:   strconv.FormatUint(tx.GasUsed, 10),
-		Timestamp: tx.BlockTime.Format("2006-01-02T15:04:05.000Z"),
+		Timestamp: tx.BlockTime.UTC().Format("2006-01-02T15:04:05Z"),
 		GasWanted: strconv.FormatUint(tx.GasWanted, 10),
 		Codespace: tx.Codespace,
 		Code:      int(tx.Code),
