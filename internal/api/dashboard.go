@@ -292,8 +292,8 @@ func (s *Server) GetTxVolume(w http.ResponseWriter, r *http.Request) {
 func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "block_rewards", 5*time.Minute, func() (interface{}, error) {
 		type Reward struct {
-			Time        uint64 `ch:"datetime"`
-			BlockReward string `ch:"blockReward"`
+			Time        uint64 `json:"datetime" ch:"datetime"`
+			BlockReward string `json:"blockReward" ch:"blockReward"`
 		}
 
 		var rewards []Reward
@@ -351,8 +351,8 @@ func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 func (s *Server) GetSeigniorageProceeds(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "seigniorage_proceeds", 5*time.Minute, func() (interface{}, error) {
 		type Proceeds struct {
-			Time   uint64 `ch:"datetime"`
-			Amount string `ch:"seigniorageProceeds"`
+			Time   uint64 `json:"datetime" ch:"datetime"`
+			Amount string `json:"seigniorageProceeds" ch:"seigniorageProceeds"`
 		}
 
 		var proceeds []Proceeds
@@ -390,8 +390,8 @@ func (s *Server) GetStakingReturn(w http.ResponseWriter, r *http.Request) {
 		// We will return 0s for now but correct structure.
 
 		type Return struct {
-			Time   uint64 `ch:"datetime"`
-			Amount string `ch:"dailyReturn"`
+			Time   uint64 `json:"datetime" ch:"datetime"`
+			Amount string `json:"dailyReturn" ch:"dailyReturn"`
 		}
 
 		var returns []Return

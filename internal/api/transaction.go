@@ -70,7 +70,7 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		sql := fmt.Sprintf(`
 			SELECT t.* 
 			FROM txs t
-			INNER JOIN account_txs a ON t.height = a.height AND t.index_in_block = a.index_in_block AND t.tx_hash = a.tx_hash
+			INNER JOIN account_txs a ON t.height = a.height AND t.index_in_block = a.index_in_block
 			WHERE %s
 			ORDER BY t.height DESC, t.index_in_block DESC
 			LIMIT ?
@@ -178,8 +178,8 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var tx model.Tx
-	// Use unhex(?) for FixedString(32)
-	err := s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM txs WHERE tx_hash = unhex(?)", hash).ScanStruct(&tx)
+	// tx_hash is FixedString(64) (hex string)
+	err := s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM txs WHERE tx_hash = ?", strings.ToUpper(hash)).ScanStruct(&tx)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Transaction not found")
 		return
