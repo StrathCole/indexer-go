@@ -19,6 +19,7 @@ import (
 	distrtypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/errgroup"
 )
 
 type EnrichedValidator struct {
@@ -225,6 +226,26 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 	return ev
 }
 
+func (s *Server) enrichValidatorsParallel(ctx context.Context, validators []stakingtypes.Validator, totalBonded float64, priceMap map[string]sdk.Dec) ([]EnrichedValidator, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(20) // Limit concurrency to avoid overwhelming the node
+
+	enriched := make([]EnrichedValidator, len(validators))
+
+	for i, v := range validators {
+		i, v := i, v
+		g.Go(func() error {
+			enriched[i] = s.enrichValidator(ctx, v, totalBonded, priceMap)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return enriched, nil
+}
+
 func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "validators", 1*time.Minute, func() (interface{}, error) {
 		stakingClient := stakingtypes.NewQueryClient(s.clientCtx)
@@ -273,11 +294,7 @@ func (s *Server) GetValidators(w http.ResponseWriter, r *http.Request) {
 			return allValidators[i].Tokens.GT(allValidators[j].Tokens)
 		})
 
-		var enriched []EnrichedValidator
-		for _, v := range allValidators {
-			enriched = append(enriched, s.enrichValidator(ctx, v, totalBonded, priceMap))
-		}
-		return enriched, nil
+		return s.enrichValidatorsParallel(ctx, allValidators, totalBonded, priceMap)
 	})
 }
 
@@ -749,90 +766,123 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		oracleClient := oracletypes.NewQueryClient(s.clientCtx)
 		ctx := context.Background()
 
+		g, ctx := errgroup.WithContext(ctx)
+
 		// 1. Fetch all validators (needed for names)
 		var allValidators []stakingtypes.Validator
-		var nextKey []byte
-		for {
-			req := &stakingtypes.QueryValidatorsRequest{
-				Pagination: &query.PageRequest{Key: nextKey, Limit: 100},
+		g.Go(func() error {
+			var nextKey []byte
+			for {
+				req := &stakingtypes.QueryValidatorsRequest{
+					Pagination: &query.PageRequest{Key: nextKey, Limit: 100},
+				}
+				resp, err := stakingClient.Validators(ctx, req)
+				if err != nil {
+					return err
+				}
+				allValidators = append(allValidators, resp.Validators...)
+				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+					break
+				}
+				nextKey = resp.Pagination.NextKey
 			}
-			resp, err := stakingClient.Validators(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-			allValidators = append(allValidators, resp.Validators...)
-			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
-				break
-			}
-			nextKey = resp.Pagination.NextKey
-		}
+			return nil
+		})
 
 		// 2. Fetch Delegations
 		var delegations []stakingtypes.DelegationResponse
-		nextKey = nil
-		for {
-			req := &stakingtypes.QueryDelegatorDelegationsRequest{
-				DelegatorAddr: account,
-				Pagination:    &query.PageRequest{Key: nextKey, Limit: 100},
+		g.Go(func() error {
+			var nextKey []byte
+			for {
+				req := &stakingtypes.QueryDelegatorDelegationsRequest{
+					DelegatorAddr: account,
+					Pagination:    &query.PageRequest{Key: nextKey, Limit: 100},
+				}
+				resp, err := stakingClient.DelegatorDelegations(ctx, req)
+				if err != nil {
+					break
+				}
+				delegations = append(delegations, resp.DelegationResponses...)
+				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+					break
+				}
+				nextKey = resp.Pagination.NextKey
 			}
-			resp, err := stakingClient.DelegatorDelegations(ctx, req)
-			if err != nil {
-				break
-			}
-			delegations = append(delegations, resp.DelegationResponses...)
-			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
-				break
-			}
-			nextKey = resp.Pagination.NextKey
-		}
+			return nil
+		})
 
 		// 3. Fetch Unbonding Delegations
 		var unbondings []stakingtypes.UnbondingDelegation
-		nextKey = nil
-		for {
-			req := &stakingtypes.QueryDelegatorUnbondingDelegationsRequest{
-				DelegatorAddr: account,
-				Pagination:    &query.PageRequest{Key: nextKey, Limit: 100},
+		g.Go(func() error {
+			var nextKey []byte
+			for {
+				req := &stakingtypes.QueryDelegatorUnbondingDelegationsRequest{
+					DelegatorAddr: account,
+					Pagination:    &query.PageRequest{Key: nextKey, Limit: 100},
+				}
+				resp, err := stakingClient.DelegatorUnbondingDelegations(ctx, req)
+				if err != nil {
+					break
+				}
+				unbondings = append(unbondings, resp.UnbondingResponses...)
+				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+					break
+				}
+				nextKey = resp.Pagination.NextKey
 			}
-			resp, err := stakingClient.DelegatorUnbondingDelegations(ctx, req)
-			if err != nil {
-				break
-			}
-			unbondings = append(unbondings, resp.UnbondingResponses...)
-			if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
-				break
-			}
-			nextKey = resp.Pagination.NextKey
-		}
+			return nil
+		})
 
 		// 4. Fetch Rewards
-		rewardsResp, err := distrClient.DelegationTotalRewards(ctx, &distrtypes.QueryDelegationTotalRewardsRequest{
-			DelegatorAddress: account,
+		var rewardsResp *distrtypes.QueryDelegationTotalRewardsResponse
+		g.Go(func() error {
+			var err error
+			rewardsResp, err = distrClient.DelegationTotalRewards(ctx, &distrtypes.QueryDelegationTotalRewardsRequest{
+				DelegatorAddress: account,
+			})
+			if err != nil {
+				// Proceed with nil rewardsResp
+				return nil
+			}
+			return nil
 		})
 
 		// 5. Fetch Balances
-		balancesResp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{
-			Address: account,
-		})
 		var balances sdk.Coins
-		if err == nil {
-			balances = balancesResp.Balances
-		}
+		g.Go(func() error {
+			balancesResp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{
+				Address: account,
+			})
+			if err == nil {
+				balances = balancesResp.Balances
+			}
+			return nil
+		})
 
 		// 6. Pool
-		poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
 		var totalBonded float64
-		if err == nil {
-			fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
-		}
+		g.Go(func() error {
+			poolResp, err := stakingClient.Pool(ctx, &stakingtypes.QueryPoolRequest{})
+			if err == nil {
+				fmt.Sscanf(poolResp.Pool.BondedTokens.String(), "%f", &totalBonded)
+			}
+			return nil
+		})
 
 		// 7. Oracle Prices
 		priceMapDec := make(map[string]sdk.Dec)
-		ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
-		if err == nil {
-			for _, r := range ratesResp.ExchangeRates {
-				priceMapDec[r.Denom] = r.Amount
+		g.Go(func() error {
+			ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
+			if err == nil {
+				for _, r := range ratesResp.ExchangeRates {
+					priceMapDec[r.Denom] = r.Amount
+				}
 			}
+			return nil
+		})
+
+		if err := g.Wait(); err != nil {
+			return nil, err
 		}
 
 		// Helper to calculate total rewards in Luna
@@ -885,12 +935,14 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Process Validators
+		enrichedValidators, err := s.enrichValidatorsParallel(ctx, allValidators, totalBonded, priceMapDec)
+		if err != nil {
+			return nil, err
+		}
+
 		valMap := make(map[string]EnrichedValidator)
-		var enrichedValidators []EnrichedValidator
-		for _, v := range allValidators {
-			ev := s.enrichValidator(ctx, v, totalBonded, priceMapDec)
-			valMap[v.OperatorAddress] = ev
-			enrichedValidators = append(enrichedValidators, ev)
+		for _, ev := range enrichedValidators {
+			valMap[ev.OperatorAddress] = ev
 		}
 
 		// My Delegations
