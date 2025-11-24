@@ -371,25 +371,20 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 	return false // Not synced yet
 }
 
-func (s *Service) fetchBlock(ctx context.Context, height int64) (*coretypes.ResultBlock, *coretypes.ResultBlockResults, error) {
+func (s *Service) ProcessBlock(height int64) error {
 	var block *coretypes.ResultBlock
 	var results *coretypes.ResultBlockResults
 	var err error
 
 	// Retry fetching block and results
 	// Sometimes the node has the block but not the results yet (race condition)
-	maxRetries := 3 // Reduced retries to fail faster
-	retryInterval := 200 * time.Millisecond
+	maxRetries := 5
+	retryInterval := 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
-		// Check context before making request
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-
-		block, err = s.rpc.Block(ctx, &height)
+		block, err = s.rpc.Block(context.Background(), &height)
 		if err == nil {
-			results, err = s.rpc.BlockResults(ctx, &height)
+			results, err = s.rpc.BlockResults(context.Background(), &height)
 		}
 
 		if err == nil {
@@ -397,37 +392,19 @@ func (s *Service) fetchBlock(ctx context.Context, height int64) (*coretypes.Resu
 		}
 
 		if i < maxRetries-1 {
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(retryInterval):
-			}
+			time.Sleep(retryInterval)
 		}
 	}
 
-	if err != nil {
-		return nil, nil, err
-	}
-	return block, results, nil
-}
-
-func (s *Service) ProcessBlock(height int64) error {
-	block, results, err := s.fetchBlock(context.Background(), height)
 	if err != nil {
 		return err
 	}
 
 	// Process
-	modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, err := s.processBlockData(block, results)
-	if err != nil {
-		return err
-	}
-
-	// Insert everything in one batch
-	return s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices)
+	return s.saveBlock(block, results)
 }
 
-func (s *Service) processBlockData(block *coretypes.ResultBlock, results *coretypes.ResultBlockResults) (model.Block, []model.Tx, []model.Event, []model.AccountTx, []model.OraclePrice, error) {
+func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.ResultBlockResults) error {
 	// Decode transactions
 	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
 
@@ -487,5 +464,12 @@ func (s *Service) processBlockData(block *coretypes.ResultBlock, results *corety
 		modelAccountTxs = append(modelAccountTxs, accountTxs...)
 	}
 
-	return modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, nil
+	// Insert everything in one batch
+	err := s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices)
+	if err != nil {
+		log.Printf("Failed to insert block/txs: %v", err)
+		return err
+	}
+
+	return nil
 }
