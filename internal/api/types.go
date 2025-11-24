@@ -121,7 +121,7 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 	}
 
 	// Convert Logs
-	var logs []FCDLog
+	logs := []FCDLog{}
 	if tx.LogsJSON != "" {
 		if err := json.Unmarshal([]byte(tx.LogsJSON), &logs); err != nil {
 			// If unmarshal fails, maybe it's not a list of FCDLog?
@@ -135,9 +135,17 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 	// Convert Signatures
 	var signatures []interface{}
 	for _, sigJSON := range tx.SignaturesJSON {
-		var sig interface{}
-		if err := json.Unmarshal([]byte(sigJSON), &sig); err == nil {
-			signatures = append(signatures, sig)
+		var sigMap map[string]interface{}
+		if err := json.Unmarshal([]byte(sigJSON), &sigMap); err == nil {
+			// Transform pub_key from Amino {"type":..., "value":...} to FCD {"key":...}
+			if pk, ok := sigMap["pub_key"].(map[string]interface{}); ok {
+				if val, ok := pk["value"].(string); ok {
+					sigMap["pub_key"] = map[string]string{
+						"key": val,
+					}
+				}
+			}
+			signatures = append(signatures, sigMap)
 		}
 	}
 

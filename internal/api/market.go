@@ -17,8 +17,8 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 	denom := query.Get("denom")
 
 	if denom == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]string{
-			"code":    "400",
+		respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"code":    400,
 			"message": "child \"denom\" fails because [\"denom\" is required]",
 			"type":    "INVALID_REQUEST_ERROR",
 		})
@@ -30,6 +30,17 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 		key += "_" + denom
 	}
 	if interval != "" {
+		validIntervals := map[string]bool{
+			"1m": true, "5m": true, "15m": true, "30m": true, "1h": true, "1d": true,
+		}
+		if !validIntervals[interval] {
+			respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"code":    400,
+				"message": "child \"interval\" fails because [\"interval\" must be one of [1m, 5m, 15m, 30m, 1h, 1d]]",
+				"type":    "INVALID_REQUEST_ERROR",
+			})
+			return
+		}
 		key += "_" + interval
 	}
 
