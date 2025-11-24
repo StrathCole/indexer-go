@@ -296,36 +296,15 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		}
 	}
 
-	// Fetch Block Events (BeginBlock, EndBlock, and Tx events)
+	// Fetch Block Events (BeginBlock and EndBlock only)
 	var dbEvents []model.Event
-	// Fetch all events for the block
-	sqlEvents := `SELECT * FROM events WHERE height = ? ORDER BY event_index ASC`
+	// Fetch events for the block, excluding tx events
+	// Order by scope to ensure begin_block (2) comes before end_block (3). 'block' (0) is legacy and comes first.
+	sqlEvents := `SELECT * FROM events WHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
 	err = s.ch.Conn.Select(context.Background(), &dbEvents, sqlEvents, block.Height)
 
 	var blockEvents []map[string]interface{}
 	if err == nil && len(dbEvents) > 0 {
-		// Bucket events
-		var beginEvents []model.Event
-		var txEvents []model.Event
-		var endEvents []model.Event
-
-		for _, e := range dbEvents {
-			switch e.Scope {
-			case "begin_block", "block":
-				beginEvents = append(beginEvents, e)
-			case "tx":
-				txEvents = append(txEvents, e)
-			case "end_block":
-				endEvents = append(endEvents, e)
-			}
-		}
-
-		// Recombine in order
-		var allEvents []model.Event
-		allEvents = append(allEvents, beginEvents...)
-		allEvents = append(allEvents, txEvents...)
-		allEvents = append(allEvents, endEvents...)
-
 		// Group by (Scope, TxIndex, EventIndex)
 		var currentEvent map[string]interface{}
 		var currentAttrs []map[string]string
@@ -335,7 +314,7 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		lastTxIndex := int16(-999)
 		lastEventIndex := uint16(65535)
 
-		for _, row := range allEvents {
+		for _, row := range dbEvents {
 			isNewEvent := false
 			if row.Scope != lastScope || row.TxIndex != lastTxIndex || row.EventIndex != lastEventIndex {
 				isNewEvent = true
