@@ -379,3 +379,27 @@ func (s *Service) addAccountTx(
 		}
 	}
 }
+
+func (s *Service) convertBlockEvents(
+	height uint64,
+	blockTime time.Time,
+	events []abcitypes.Event,
+) []model.Event {
+	var modelEvents []model.Event
+	for i, event := range events {
+		for _, attr := range event.Attributes {
+			modelEvents = append(modelEvents, model.Event{
+				Height:     height,
+				BlockTime:  blockTime,
+				Scope:      "block",
+				TxIndex:    -1,
+				EventIndex: uint16(i),
+				EventType:  event.Type,
+				AttrKey:    string(attr.Key),
+				AttrValue:  string(attr.Value),
+				TxHash:     "",
+			})
+		}
+	}
+	return modelEvents
+}

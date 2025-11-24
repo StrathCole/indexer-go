@@ -422,6 +422,21 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
 
+	// Convert Block Events (BeginBlock & EndBlock)
+	beginBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		results.BeginBlockEvents,
+	)
+	endBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		results.EndBlockEvents,
+	)
+
+	modelEvents = append(modelEvents, beginBlockEvents...)
+	modelEvents = append(modelEvents, endBlockEvents...)
+
 	for i, txBytes := range block.Block.Txs {
 		decodedTx, err := txDecoder(txBytes)
 		if err != nil {

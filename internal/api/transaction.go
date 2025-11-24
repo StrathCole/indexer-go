@@ -292,12 +292,51 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		}
 	}
 
+	// Fetch Block Events
+	var dbEvents []model.Event
+	sqlEvents := `SELECT * FROM events WHERE height = ? AND scope = 'block' ORDER BY event_index ASC`
+	err = s.ch.Conn.Select(context.Background(), &dbEvents, sqlEvents, block.Height)
+
+	var blockEvents []map[string]interface{}
+	if err == nil && len(dbEvents) > 0 {
+		// Group by EventIndex
+		currentIdx := -1
+		var currentEvent map[string]interface{}
+		var currentAttrs []map[string]string
+
+		for _, row := range dbEvents {
+			if int(row.EventIndex) != currentIdx {
+				if currentIdx != -1 {
+					currentEvent["attributes"] = currentAttrs
+					blockEvents = append(blockEvents, currentEvent)
+				}
+				currentIdx = int(row.EventIndex)
+				currentEvent = map[string]interface{}{
+					"type": row.EventType,
+				}
+				currentAttrs = []map[string]string{}
+			}
+			currentAttrs = append(currentAttrs, map[string]string{
+				"key":   row.AttrKey,
+				"value": row.AttrValue,
+			})
+		}
+		// Append last one
+		if currentIdx != -1 {
+			currentEvent["attributes"] = currentAttrs
+			blockEvents = append(blockEvents, currentEvent)
+		}
+	} else {
+		blockEvents = []map[string]interface{}{}
+	}
+
 	response := map[string]interface{}{
 		"chainId":   "columbus-5", // Hardcoded
 		"height":    block.Height,
 		"timestamp": block.BlockTime.Format(time.RFC3339),
 		"proposer":  proposer,
 		"txs":       fcdTxs,
+		"events":    blockEvents,
 	}
 
 	respondJSON(w, http.StatusOK, response)
