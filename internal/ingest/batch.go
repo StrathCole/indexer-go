@@ -54,6 +54,8 @@ func (s *Service) BatchInsert(
 				t.GasUsed,
 				t.FeeAmounts,
 				t.FeeDenomIDs,
+				t.TaxAmounts,
+				t.TaxDenomIDs,
 				t.MsgTypeIDs,
 				t.MsgsJSON,
 				t.Memo,
