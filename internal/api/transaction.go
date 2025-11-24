@@ -351,8 +351,10 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 					"type":  row.EventType,
 					"stage": row.Scope,
 				}
-				if row.TxHash != "" {
-					currentEvent["tx_hash"] = row.TxHash
+				// Clean up TxHash (remove null bytes)
+				txHash := strings.Trim(row.TxHash, "\x00")
+				if txHash != "" {
+					currentEvent["tx_hash"] = txHash
 				}
 				currentAttrs = []map[string]string{}
 
