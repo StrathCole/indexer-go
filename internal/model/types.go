@@ -1,9 +1,6 @@
 package model
 
 import (
-	"encoding/hex"
-	"encoding/json"
-	"strings"
 	"time"
 )
 
@@ -69,48 +66,4 @@ type OraclePrice struct {
 	Denom     string    `ch:"denom"`
 	Price     float64   `ch:"price"`
 	Currency  string    `ch:"currency"`
-}
-
-func (b Block) MarshalJSON() ([]byte, error) {
-	type Alias Block
-	return json.Marshal(&struct {
-		BlockHash string
-		*Alias
-	}{
-		BlockHash: strings.ToUpper(hex.EncodeToString([]byte(b.BlockHash))),
-		Alias:     (*Alias)(&b),
-	})
-}
-
-func (t Tx) MarshalJSON() ([]byte, error) {
-	type Alias Tx
-	return json.Marshal(&struct {
-		TxHash string
-		*Alias
-	}{
-		TxHash: strings.ToUpper(hex.EncodeToString([]byte(t.TxHash))),
-		Alias:  (*Alias)(&t),
-	})
-}
-
-func (e Event) MarshalJSON() ([]byte, error) {
-	type Alias Event
-	return json.Marshal(&struct {
-		TxHash string
-		*Alias
-	}{
-		TxHash: strings.ToUpper(hex.EncodeToString([]byte(e.TxHash))),
-		Alias:  (*Alias)(&e),
-	})
-}
-
-func (a AccountTx) MarshalJSON() ([]byte, error) {
-	type Alias AccountTx
-	return json.Marshal(&struct {
-		TxHash string
-		*Alias
-	}{
-		TxHash: strings.ToUpper(hex.EncodeToString([]byte(a.TxHash))),
-		Alias:  (*Alias)(&a),
-	})
 }

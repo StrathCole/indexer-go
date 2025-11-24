@@ -2,7 +2,7 @@
 
 CREATE TABLE IF NOT EXISTS blocks (
     height          UInt64,
-    block_hash      FixedString(32),
+    block_hash      FixedString(64),
     block_time      DateTime,
     proposer_address String,
     tx_count        UInt32
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS txs (
     height          UInt64,
     index_in_block  UInt16,
     block_time      DateTime,
-    tx_hash         FixedString(32),
+    tx_hash         FixedString(64),
     codespace       LowCardinality(String),
     code            UInt32,
     gas_wanted      UInt64,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS events (
     event_type      LowCardinality(String),
     attr_key        LowCardinality(String),
     attr_value      String,
-    tx_hash         FixedString(32) DEFAULT unhex('')
+    tx_hash         FixedString(64) DEFAULT ''
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS account_txs (
     height          UInt64,
     index_in_block  UInt16,
     block_time      DateTime,
-    tx_hash         FixedString(32),
+    tx_hash         FixedString(64),
     direction       Int8, -- 0: unknown, 1: in, 2: out
     main_denom_id   UInt16,
     main_amount     Int64

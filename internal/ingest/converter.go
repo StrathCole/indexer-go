@@ -2,7 +2,6 @@ package ingest
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -19,7 +18,7 @@ import (
 func (s *Service) convertBlock(block *coretypes.ResultBlock) model.Block {
 	return model.Block{
 		Height:          uint64(block.Block.Height),
-		BlockHash:       string(block.BlockID.Hash),
+		BlockHash:       block.BlockID.Hash.String(),
 		BlockTime:       block.Block.Time,
 		ProposerAddress: block.Block.ProposerAddress.String(),
 		TxCount:         uint32(len(block.Block.Txs)),
@@ -79,12 +78,8 @@ func (s *Service) convertTx(
 	}
 	res := txRes.TxsResults[index]
 
-	// Convert txHash (Hex) to raw bytes string for ClickHouse FixedString(32)
-	txHashBytes, err := hex.DecodeString(txHash)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to decode tx hash: %w", err)
-	}
-	txHashRaw := string(txHashBytes)
+	// txHash is already Hex string. Use it directly for ClickHouse FixedString(64)
+	txHashRaw := txHash
 
 	cdc := app.MakeEncodingConfig().Marshaler
 
