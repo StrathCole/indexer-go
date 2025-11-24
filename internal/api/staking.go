@@ -911,7 +911,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 			for _, c := range coins {
 				res = append(res, map[string]string{
 					"denom":  c.Denom,
-					"amount": c.Amount.String(),
+					"amount": c.Amount.TruncateInt().String(),
 				})
 			}
 			sort.Slice(res, func(i, j int) bool {

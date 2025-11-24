@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
@@ -37,13 +38,46 @@ GROUP BY denom
 		// Log error?
 	}
 
-	if proceeds == nil {
-		proceeds = []TaxProceed{}
+	// Fetch Oracle Prices
+	oracleClient := oracletypes.NewQueryClient(s.clientCtx)
+	priceMap := make(map[string]sdk.Dec)
+	ratesResp, err := oracleClient.ExchangeRates(context.Background(), &oracletypes.QueryExchangeRatesRequest{})
+	if err == nil {
+		for _, r := range ratesResp.ExchangeRates {
+			priceMap[r.Denom] = r.Amount
+		}
+	}
+
+	var filteredProceeds []TaxProceed
+	total := sdk.ZeroDec()
+
+	for _, p := range proceeds {
+		amount, err := sdk.NewDecFromStr(p.Total)
+		if err != nil {
+			continue
+		}
+
+		if p.Denom == "uluna" {
+			p.AdjustedAmount = p.Total
+			total = total.Add(amount)
+			filteredProceeds = append(filteredProceeds, p)
+		} else {
+			if price, ok := priceMap[p.Denom]; ok && !price.IsZero() {
+				adj := amount.Quo(price)
+				p.AdjustedAmount = adj.String()
+				total = total.Add(adj)
+				filteredProceeds = append(filteredProceeds, p)
+			}
+		}
+	}
+
+	if filteredProceeds == nil {
+		filteredProceeds = []TaxProceed{}
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"total":       "0",
-		"taxProceeds": proceeds,
+		"total":       total.String(),
+		"taxProceeds": filteredProceeds,
 	})
 }
 

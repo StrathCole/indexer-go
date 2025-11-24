@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -281,29 +282,13 @@ func (s *Server) GetMarketSwapRate(w http.ResponseWriter, r *http.Request) {
 		denoms["uluna"] = true
 		denoms[base] = true
 
-		for denom := range denoms {
-			if denom == base && base != "uluna" {
-				// Base itself is added separately in legacy?
-				// Legacy: Object.keys(currentSwapRate).map...
-				// currentSwapRate includes base?
-				// Legacy getSwapRate:
-				// if base == BOND_DENOM return prices (which includes all denoms)
-				// else ... { ...acc, [curr]: div(prices[curr], prices[base]) }, { uluna: lunaSwapRate }
-				// It seems it includes all denoms from prices + uluna.
-				// Does it include base?
-				// "if (curr === base) { return acc }" -> It skips base in reduce.
-				// But it initializes with { uluna: ... }.
-				// So base is NOT in the map?
-				// Wait, if base is uusd. prices has uusd.
-				// It skips uusd in reduce.
-				// So uusd is NOT in the result?
-				// Let's check the diff.
-				// Diff for uusd swaprate has uusd?
-				// No, the diff output I saw earlier:
-				// [ { denom: "uluna", ... }, { denom: "uaud", ... }, ... ]
-				// It does NOT show "uusd" (the base).
-				// So I should SKIP base if base != uluna.
-			}
+		var sortedDenoms []string
+		for d := range denoms {
+			sortedDenoms = append(sortedDenoms, d)
+		}
+		sort.Strings(sortedDenoms)
+
+		for _, denom := range sortedDenoms {
 			if denom == base && base != "uluna" {
 				continue
 			}

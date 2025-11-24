@@ -215,6 +215,7 @@ func (s *Server) GetGasPrices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
+	account := r.URL.Query().Get("account")
 	limit := 100
 	res, err := s.rpc.UnconfirmedTxs(context.Background(), &limit)
 	if err != nil {
@@ -229,6 +230,24 @@ func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
 	for _, txBytes := range res.Txs {
 		tx, err := txDecoder(txBytes)
 		if err == nil {
+			if account != "" {
+				found := false
+				for _, msg := range tx.GetMsgs() {
+					for _, signer := range msg.GetSigners() {
+						if signer.String() == account {
+							found = true
+							break
+						}
+					}
+					if found {
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+
 			// Marshal to JSON
 			jsonBytes, err := txEncoder(tx)
 			if err == nil {
@@ -246,7 +265,7 @@ func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"total": res.Total,
+		"total": len(decodedTxs),
 		"txs":   decodedTxs,
 	})
 }

@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS blocks (
     height          UInt64,
     block_hash      FixedString(64),
-    block_time      DateTime,
+    block_time      DateTime64(3),
     proposer_address String,
     tx_count        UInt32
 )
@@ -14,7 +14,7 @@ ORDER BY (height);
 CREATE TABLE IF NOT EXISTS txs (
     height          UInt64,
     index_in_block  UInt16,
-    block_time      DateTime,
+    block_time      DateTime64(3),
     tx_hash         FixedString(64),
     codespace       LowCardinality(String),
     code            UInt32,
@@ -38,7 +38,7 @@ ORDER BY (height, index_in_block);
 
 CREATE TABLE IF NOT EXISTS events (
     height          UInt64,
-    block_time      DateTime,
+    block_time      DateTime64(3),
     scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
     tx_index        Int16,                 -- -1 for block-level events
     event_index     UInt16,
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS account_txs (
     address_id      UInt64,
     height          UInt64,
     index_in_block  UInt16,
-    block_time      DateTime,
+    block_time      DateTime64(3),
     tx_hash         FixedString(64),
     direction       Int8, -- 0: unknown, 1: in, 2: out
     main_denom_id   UInt16,
@@ -67,7 +67,7 @@ ORDER BY (address_id, height, index_in_block);
 
 -- New table for Oracle Prices (Time Series)
 CREATE TABLE IF NOT EXISTS oracle_prices (
-    block_time      DateTime,
+    block_time      DateTime64(3),
     height          UInt64,
     denom           LowCardinality(String),
     price           Float64,
@@ -79,7 +79,7 @@ ORDER BY (denom, block_time);
 
 -- Validator Returns (Historical) - Replaces ValidatorReturnInfoEntity
 CREATE TABLE IF NOT EXISTS validator_returns (
-    block_time      DateTime,
+    block_time      DateTime64(3),
     height          UInt64,
     operator_address String,
     commission      Map(String, Float64),
@@ -91,7 +91,7 @@ ORDER BY (operator_address, block_time);
 
 -- Block Rewards (Historical) - Replaces BlockRewardEntity
 CREATE TABLE IF NOT EXISTS block_rewards (
-    block_time      DateTime,
+    block_time      DateTime64(3),
     height          UInt64,
     total_reward    Map(String, Float64),
     total_commission Map(String, Float64)
