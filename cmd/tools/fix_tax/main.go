@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 
 	"github.com/classic-terra/core/v3/app"
@@ -48,12 +49,19 @@ func main() {
 	var grpcConn *grpc.ClientConn
 	if cfg.Node.GRPC != "" {
 		grpcURL := cfg.Node.GRPC
-		secure := false
-		if strings.HasPrefix(grpcURL, "https://") || strings.HasSuffix(grpcURL, ":443") {
-			secure = true
+
+		// Ensure scheme for parsing
+		if !strings.Contains(grpcURL, "://") {
+			grpcURL = "https://" + grpcURL
 		}
-		grpcURL = strings.TrimPrefix(grpcURL, "https://")
-		grpcURL = strings.TrimPrefix(grpcURL, "http://")
+
+		u, err := url.Parse(grpcURL)
+		if err != nil {
+			log.Fatalf("Failed to parse gRPC URL: %v", err)
+		}
+
+		target := u.Host
+		secure := u.Scheme == "https" || strings.HasSuffix(target, ":443")
 
 		var creds credentials.TransportCredentials
 		if secure {
@@ -62,7 +70,7 @@ func main() {
 			creds = insecure.NewCredentials()
 		}
 
-		grpcConn, err = grpc.Dial(grpcURL, grpc.WithTransportCredentials(creds))
+		grpcConn, err = grpc.Dial(target, grpc.WithTransportCredentials(creds))
 		if err != nil {
 			log.Fatalf("Failed to dial gRPC: %v", err)
 		}
