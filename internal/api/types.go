@@ -130,6 +130,13 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 			// FCD logs are usually a list of objects with msg_index, log, events.
 			// Our LogsJSON comes from txRes.Log which might be string or json.
 			// If it's a string, we can't do much.
+		} else {
+			// Sanitize logs: ensure Log field is empty string if nil
+			for i := range logs {
+				if logs[i].Log == nil {
+					logs[i].Log = ""
+				}
+			}
 		}
 	}
 
@@ -206,14 +213,19 @@ func (s *Server) MapTxToFCD(tx model.Tx, denoms map[uint16]string, msgTypes map[
 func mapProtoToAmino(protoName string) string {
 	// terra.oracle.v1beta1.MsgAggregateExchangeRatePrevote -> oracle/MsgAggregateExchangeRatePrevote
 	// cosmos.bank.v1beta1.MsgSend -> bank/MsgSend
+	// cosmwasm.wasm.v1.MsgExecuteContract -> wasm/MsgExecuteContract
 
 	parts := strings.Split(protoName, ".")
 	if len(parts) > 2 {
-		// Check for cosmos or terra prefix
+		// Check for cosmos, terra, or cosmwasm prefix
 		if parts[0] == "cosmos" || parts[0] == "terra" {
 			// module is parts[1]
 			msgName := parts[len(parts)-1]
 			return fmt.Sprintf("%s/%s", parts[1], msgName)
+		}
+		if parts[0] == "cosmwasm" && parts[1] == "wasm" {
+			msgName := parts[len(parts)-1]
+			return fmt.Sprintf("wasm/%s", msgName)
 		}
 	}
 	return protoName
