@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/db"
@@ -350,20 +349,6 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 
 	log.Printf("Backfill: Syncing range %d to %d (FillGaps: %v)", startBlock, endBlock, s.fillGaps)
 
-	var (
-		blocks       []model.Block
-		txs          []model.Tx
-		events       []model.Event
-		accountTxs   []model.AccountTx
-		oraclePrices []model.OraclePrice
-		mu           sync.Mutex
-		wg           sync.WaitGroup
-	)
-
-	// Concurrency limit
-	concurrency := 10
-	sem := make(chan struct{}, concurrency)
-
 	for h := startBlock; h <= endBlock; h++ {
 		// Check if exists (Live ingest might have caught it)
 		exists, err := s.ch.BlockExists(ctx, h)
@@ -375,39 +360,9 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 			continue
 		}
 
-		wg.Add(1)
-		go func(height int64) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			block, results, err := s.fetchBlock(ctx, height)
-			if err != nil {
-				log.Printf("Backfill: Failed to fetch block %d: %v", height, err)
-				return
-			}
-
-			b, t, e, a, o, err := s.processBlockData(block, results)
-			if err != nil {
-				log.Printf("Backfill: Failed to process block %d: %v", height, err)
-				return
-			}
-
-			mu.Lock()
-			blocks = append(blocks, b)
-			txs = append(txs, t...)
-			events = append(events, e...)
-			accountTxs = append(accountTxs, a...)
-			oraclePrices = append(oraclePrices, o...)
-			mu.Unlock()
-		}(h)
-	}
-	wg.Wait()
-
-	if len(blocks) > 0 {
-		err := s.BatchInsert(ctx, blocks, txs, events, accountTxs, oraclePrices)
-		if err != nil {
-			log.Printf("Backfill: Failed to batch insert: %v", err)
+		if err := s.ProcessBlock(h); err != nil {
+			log.Printf("Backfill: Failed to process block %d: %v", h, err)
+			break
 		}
 	}
 
@@ -423,10 +378,15 @@ func (s *Service) fetchBlock(ctx context.Context, height int64) (*coretypes.Resu
 
 	// Retry fetching block and results
 	// Sometimes the node has the block but not the results yet (race condition)
-	maxRetries := 5
-	retryInterval := 500 * time.Millisecond
+	maxRetries := 3 // Reduced retries to fail faster
+	retryInterval := 200 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
+		// Check context before making request
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+
 		block, err = s.rpc.Block(ctx, &height)
 		if err == nil {
 			results, err = s.rpc.BlockResults(ctx, &height)
@@ -437,7 +397,11 @@ func (s *Service) fetchBlock(ctx context.Context, height int64) (*coretypes.Resu
 		}
 
 		if i < maxRetries-1 {
-			time.Sleep(retryInterval)
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(retryInterval):
+			}
 		}
 	}
 
