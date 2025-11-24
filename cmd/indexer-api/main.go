@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -59,21 +61,59 @@ func main() {
 	var grpcConn *grpc.ClientConn
 	if cfg.Node.GRPC != "" {
 		grpcURL := cfg.Node.GRPC
-		secure := false
-		if strings.HasPrefix(grpcURL, "https://") || strings.HasSuffix(grpcURL, ":443") {
-			secure = true
+
+		// Ensure scheme for parsing
+		if !strings.Contains(grpcURL, "://") {
+			grpcURL = "https://" + grpcURL
 		}
-		grpcURL = strings.TrimPrefix(grpcURL, "https://")
-		grpcURL = strings.TrimPrefix(grpcURL, "http://")
+
+		u, err := url.Parse(grpcURL)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to parse gRPC URL")
+		}
+
+		target := u.Host
+		if !strings.Contains(target, ":") {
+			if u.Scheme == "https" {
+				target = target + ":443"
+			} else {
+				target = target + ":80"
+			}
+		}
+
+		secure := u.Scheme == "https" || strings.HasSuffix(target, ":443")
 
 		var creds credentials.TransportCredentials
 		if secure {
-			creds = credentials.NewTLS(&tls.Config{})
+			creds = credentials.NewTLS(&tls.Config{
+				ServerName: u.Hostname(),
+			})
 		} else {
 			creds = insecure.NewCredentials()
 		}
 
-		grpcConn, err = grpc.Dial(grpcURL, grpc.WithTransportCredentials(creds))
+		dialOpts := []grpc.DialOption{
+			grpc.WithTransportCredentials(creds),
+		}
+
+		// If path is present, use it as a prefix for method calls (path-based routing)
+		if len(u.Path) > 0 && u.Path != "/" {
+			pathPrefix := u.Path
+			if !strings.HasPrefix(pathPrefix, "/") {
+				pathPrefix = "/" + pathPrefix
+			}
+			pathPrefix = strings.TrimSuffix(pathPrefix, "/")
+
+			interceptor := func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+				return invoker(ctx, pathPrefix+method, req, reply, cc, opts...)
+			}
+			dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(interceptor))
+		}
+
+		// Force authority to match hostname (without port) to satisfy strict Nginx/Cloudflare checks
+		dialOpts = append(dialOpts, grpc.WithAuthority(u.Hostname()))
+
+		grpcConn, err = grpc.Dial(target, dialOpts...)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to dial gRPC")
 		}
