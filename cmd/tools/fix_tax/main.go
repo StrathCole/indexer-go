@@ -191,7 +191,7 @@ func main() {
 
 			// Debug log for first few
 			if i < 5 && len(calculatedTax) > 0 {
-				log.Printf("Tx %X: Calculated Tax: %v", tx.TxHash, calculatedTax)
+				log.Printf("Tx %s: Calculated Tax: %v", tx.TxHash, calculatedTax)
 			}
 
 			if len(calculatedTax) > 0 {
