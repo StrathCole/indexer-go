@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/db"
@@ -28,9 +29,12 @@ import (
 )
 
 type Service struct {
-	ch  *db.ClickHouse
-	pg  *db.Postgres
-	rpc *rpchttp.HTTP
+	ch *db.ClickHouse
+	pg *db.Postgres
+
+	mu      sync.RWMutex
+	rpc     *rpchttp.HTTP
+	nodeRPC string
 
 	clientCtx client.Context
 
@@ -131,6 +135,7 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		ch:                ch,
 		pg:                pg,
 		rpc:               rpcClient,
+		nodeRPC:           nodeRPC,
 		clientCtx:         clientCtx,
 		grpcConn:          grpcConn,
 		dims:              NewDimensions(pg),
@@ -144,6 +149,35 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		fillGaps:          fillGaps,
 		backfillCursor:    startHeight,
 	}, nil
+}
+
+func (s *Service) getRPC() *rpchttp.HTTP {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rpc
+}
+
+func (s *Service) reconnectRPC() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.rpc != nil {
+		// Try to stop if running, ignore error
+		_ = s.rpc.Stop()
+	}
+
+	rpcClient, err := rpchttp.New(s.nodeRPC, "/websocket")
+	if err != nil {
+		return fmt.Errorf("failed to create RPC client: %w", err)
+	}
+
+	if err := rpcClient.Start(); err != nil {
+		return fmt.Errorf("failed to start RPC client: %w", err)
+	}
+
+	s.rpc = rpcClient
+	s.clientCtx = s.clientCtx.WithClient(rpcClient)
+	return nil
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -176,20 +210,24 @@ func (s *Service) startLiveIngest(ctx context.Context) {
 		}
 
 		// Ensure RPC is running
-		if !s.rpc.IsRunning() {
-			if err := s.rpc.Start(); err != nil {
+		rpc := s.getRPC()
+		if rpc == nil || !rpc.IsRunning() {
+			if err := s.reconnectRPC(); err != nil {
 				log.Printf("Live Ingest: Failed to start RPC client: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
+			rpc = s.getRPC()
 		}
 
 		// Subscribe to NewBlock events
-		eventCh, err := s.rpc.Subscribe(ctx, "indexer-ingest", "tm.event='NewBlock'")
+		eventCh, err := rpc.Subscribe(ctx, "indexer-ingest", "tm.event='NewBlock'")
 		if err != nil {
 			log.Printf("Live Ingest: Failed to subscribe to NewBlock events: %v", err)
 			// Try to stop and restart
-			s.rpc.Stop()
+			if err := s.reconnectRPC(); err != nil {
+				log.Printf("Live Ingest: Failed to reconnect RPC: %v", err)
+			}
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -253,9 +291,9 @@ func (s *Service) startLiveIngest(ctx context.Context) {
 
 		// Cleanup before reconnecting
 		ctxUnsub, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		s.rpc.UnsubscribeAll(ctxUnsub, "indexer-ingest")
+		rpc.UnsubscribeAll(ctxUnsub, "indexer-ingest")
 		cancel()
-		s.rpc.Stop()
+		rpc.Stop()
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -297,7 +335,13 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 	// 2. Determine startBlock based on mode (FillGaps vs Append)
 	// 3. Process batch
 
-	status, err := s.rpc.Status(ctx)
+	rpc := s.getRPC()
+	if rpc == nil {
+		log.Printf("Backfill: RPC client not available")
+		return true
+	}
+
+	status, err := rpc.Status(ctx)
 	if err != nil {
 		log.Printf("Backfill: Failed to get node status: %v", err)
 		return true // Treat as synced/wait on error
@@ -426,15 +470,20 @@ func (s *Service) ProcessBlock(height int64) error {
 	var results *coretypes.ResultBlockResults
 	var err error
 
+	rpc := s.getRPC()
+	if rpc == nil {
+		return fmt.Errorf("RPC client not available")
+	}
+
 	// Retry fetching block and results
 	// Sometimes the node has the block but not the results yet (race condition)
 	maxRetries := 5
 	retryInterval := 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
-		block, err = s.rpc.Block(context.Background(), &height)
+		block, err = rpc.Block(context.Background(), &height)
 		if err == nil {
-			results, err = s.rpc.BlockResults(context.Background(), &height)
+			results, err = rpc.BlockResults(context.Background(), &height)
 		}
 
 		if err == nil {
