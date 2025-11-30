@@ -48,26 +48,27 @@ type Event struct {
 	TxHash     string    `ch:"tx_hash"`
 }
 
-// AccountTx represents an account transaction in ClickHouse
+// AccountTx represents an account activity record in ClickHouse
+// Used for both transactions and block events
 type AccountTx struct {
 	AddressID    uint64    `ch:"address_id"`
 	Height       uint64    `ch:"height"`
 	IndexInBlock uint16    `ch:"index_in_block"`
 	BlockTime    time.Time `ch:"block_time"`
 	TxHash       string    `ch:"tx_hash"`
-	Direction    int8      `ch:"direction"`
+	Direction    int8      `ch:"direction"` // 0: unknown, 1: in, 2: out
 	MainDenomID  uint16    `ch:"main_denom_id"`
 	MainAmount   int64     `ch:"main_amount"`
+	IsBlockEvent bool      `ch:"is_block_event"` // true for begin_block/end_block events
+	EventScope   int8      `ch:"event_scope"`    // 0: tx, 1: begin_block, 2: end_block
 }
 
-// AccountBlock represents an account-block relation in ClickHouse
-// This tracks addresses found in begin_block and end_block events
-type AccountBlock struct {
-	AddressID uint64    `ch:"address_id"`
-	Height    uint64    `ch:"height"`
-	BlockTime time.Time `ch:"block_time"`
-	Scope     string    `ch:"scope"` // 'begin_block' or 'end_block'
-}
+// EventScope constants
+const (
+	EventScopeTx         int8 = 0
+	EventScopeBeginBlock int8 = 1
+	EventScopeEndBlock   int8 = 2
+)
 
 // OraclePrice represents an oracle price in ClickHouse
 type OraclePrice struct {

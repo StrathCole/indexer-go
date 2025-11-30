@@ -18,11 +18,11 @@ import (
 )
 
 func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	account := strings.TrimSpace(query.Get("account"))
-	block := query.Get("block")
-	limitStr := query.Get("limit")
-	offsetStr := query.Get("offset")
+	queryParams := r.URL.Query()
+	account := strings.TrimSpace(queryParams.Get("account"))
+	block := queryParams.Get("block")
+	limitStr := queryParams.Get("limit")
+	offsetStr := queryParams.Get("offset")
 
 	limit := 10
 	if limitStr != "" {
@@ -44,41 +44,132 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 	var txs []model.Tx
 	var err error
 
+	// Fetch Denoms and MsgTypes early for use in both tx and block event responses
+	denoms, _ := s.getDenoms(context.Background())
+	if denoms == nil {
+		denoms = make(map[uint16]string)
+	}
+	msgTypes, _ := s.getMsgTypes(context.Background())
+	if msgTypes == nil {
+		msgTypes = make(map[uint16]string)
+	}
+
 	if account != "" {
 		// Get address ID
 		var addressID uint64
 		err = s.pg.Pool.QueryRow(context.Background(), "SELECT id FROM addresses WHERE address = $1", account).Scan(&addressID)
 		if err != nil {
-			w.Header().Set("X-Debug-Error", err.Error())
 			// Address not found, return empty list
 			respondJSON(w, http.StatusOK, map[string]interface{}{
-				"txs": []model.Tx{},
+				"txs":   []interface{}{},
+				"limit": limit,
+				"next":  0,
 			})
 			return
 		}
 
+		// Query account_txs to get all activity (both txs and block events)
 		var args []interface{}
-		whereClause := "a.address_id = ?"
+		whereClause := "address_id = ?"
 		args = append(args, addressID)
 
 		if offset > 0 {
 			height := offset / 100000
 			index := offset % 100000
-			whereClause += " AND (t.height < ? OR (t.height = ? AND t.index_in_block < ?))"
+			whereClause += " AND (height < ? OR (height = ? AND index_in_block < ?))"
 			args = append(args, height, height, index)
 		}
 
 		sql := fmt.Sprintf(`
-			SELECT t.* 
-			FROM txs t
-			INNER JOIN account_txs a ON t.height = a.height AND t.index_in_block = a.index_in_block
+			SELECT address_id, height, index_in_block, block_time, tx_hash, direction, main_denom_id, main_amount, is_block_event, event_scope
+			FROM account_txs
 			WHERE %s
-			ORDER BY t.height DESC, t.index_in_block DESC
+			ORDER BY height DESC, index_in_block DESC
 			LIMIT ?
 		`, whereClause)
 		args = append(args, limit)
 
-		err = s.ch.Conn.Select(context.Background(), &txs, sql, args...)
+		var accountTxs []model.AccountTx
+		err = s.ch.Conn.Select(context.Background(), &accountTxs, sql, args...)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch activity: %v", err))
+			return
+		}
+
+		// Separate into tx entries and block event entries
+		var txHeightIndexPairs []string
+		var blockEventEntries []model.AccountTx
+
+		for _, at := range accountTxs {
+			if at.IsBlockEvent {
+				// This is a block event
+				blockEventEntries = append(blockEventEntries, at)
+			} else {
+				// This is a transaction
+				txHeightIndexPairs = append(txHeightIndexPairs, fmt.Sprintf("(%d, %d)", at.Height, at.IndexInBlock))
+			}
+		}
+
+		// Fetch actual transaction data for tx entries
+		if len(txHeightIndexPairs) > 0 {
+			txSQL := fmt.Sprintf(`
+				SELECT * FROM txs 
+				WHERE (height, index_in_block) IN (%s)
+				ORDER BY height DESC, index_in_block DESC
+			`, strings.Join(txHeightIndexPairs, ","))
+			err = s.ch.Conn.Select(context.Background(), &txs, txSQL)
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch txs: %v", err))
+				return
+			}
+		}
+
+		// Build unified response
+		var responses []interface{}
+
+		// Create a map of txs by height+index for quick lookup
+		txMap := make(map[string]model.Tx)
+		for _, tx := range txs {
+			key := fmt.Sprintf("%d-%d", tx.Height, tx.IndexInBlock)
+			txMap[key] = tx
+		}
+
+		// Process in order of accountTxs (which is already sorted)
+		for _, at := range accountTxs {
+			if at.IsBlockEvent {
+				// Block event - create special response
+				eventType := "begin_block"
+				if at.EventScope == model.EventScopeEndBlock {
+					eventType = "end_block"
+				}
+				responses = append(responses, map[string]interface{}{
+					"id":        at.Height*100000 + uint64(at.IndexInBlock),
+					"type":      "block_event",
+					"eventType": eventType,
+					"height":    strconv.FormatUint(at.Height, 10),
+					"timestamp": at.BlockTime.UTC().Format("2006-01-02T15:04:05Z"),
+				})
+			} else {
+				// Transaction - use FCD format
+				key := fmt.Sprintf("%d-%d", at.Height, at.IndexInBlock)
+				if tx, ok := txMap[key]; ok {
+					responses = append(responses, s.MapTxToFCD(tx, denoms, msgTypes))
+				}
+			}
+		}
+
+		var next uint64
+		if len(accountTxs) > 0 {
+			last := accountTxs[len(accountTxs)-1]
+			next = last.Height*100000 + uint64(last.IndexInBlock)
+		}
+
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"txs":   responses,
+			"limit": limit,
+			"next":  next,
+		})
+		return
 
 	} else if block != "" {
 		height, err := strconv.ParseUint(block, 10, 64)
@@ -134,20 +225,6 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch txs: %v", err))
 		return
-	}
-
-	// Fetch Denoms
-	denoms, err := s.getDenoms(context.Background())
-	if err != nil {
-		// Log error but continue with unknown denoms?
-		// For now, just empty map
-		denoms = make(map[uint16]string)
-	}
-
-	// Fetch MsgTypes
-	msgTypes, err := s.getMsgTypes(context.Background())
-	if err != nil {
-		msgTypes = make(map[uint16]string)
 	}
 
 	// Map to FCD format

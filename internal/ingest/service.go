@@ -528,7 +528,6 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelTxs []model.Tx
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
-	var modelAccountBlocks []model.AccountBlock
 
 	// Convert Block Events (BeginBlock & EndBlock)
 	beginBlockEvents := s.convertBlockEvents(
@@ -547,8 +546,8 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	modelEvents = append(modelEvents, beginBlockEvents...)
 	modelEvents = append(modelEvents, endBlockEvents...)
 
-	// Extract account-block relations from block events
-	beginAccountBlocks, err := s.extractAccountBlocks(
+	// Extract account activity from block events (stored in account_txs with special index values)
+	beginBlockAccountTxs, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -558,10 +557,10 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	if err != nil {
 		log.Printf("Failed to extract begin_block account relations: %v", err)
 	} else {
-		modelAccountBlocks = append(modelAccountBlocks, beginAccountBlocks...)
+		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
 	}
 
-	endAccountBlocks, err := s.extractAccountBlocks(
+	endBlockAccountTxs, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -571,7 +570,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	if err != nil {
 		log.Printf("Failed to extract end_block account relations: %v", err)
 	} else {
-		modelAccountBlocks = append(modelAccountBlocks, endAccountBlocks...)
+		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
 	}
 
 	for i, txBytes := range block.Block.Txs {
@@ -602,7 +601,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	}
 
 	// Insert everything in one batch
-	err = s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, modelAccountBlocks, oraclePrices, validatorReturns, blockRewards)
+	err = s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices, validatorReturns, blockRewards)
 	if err != nil {
 		log.Printf("Failed to insert block/txs: %v", err)
 		return err

@@ -33,7 +33,6 @@ func main() {
 	startHeight := flag.Int64("start", 0, "Start height (0 = from beginning)")
 	endHeight := flag.Int64("end", 0, "End height (0 = to latest)")
 	batchSize := flag.Int("batch", 10000, "Batch size for processing")
-	createTable := flag.Bool("create-table", false, "Create account_blocks table if not exists")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -60,25 +59,6 @@ func main() {
 
 	ctx := context.Background()
 
-	if *createTable {
-		log.Println("Creating account_blocks table...")
-		createTableSQL := `
-			CREATE TABLE IF NOT EXISTS account_blocks (
-				address_id      UInt64,
-				height          UInt64,
-				block_time      DateTime64(3),
-				scope           Enum8('begin_block' = 0, 'end_block' = 1)
-			)
-			ENGINE = MergeTree
-			PARTITION BY toYYYYMM(block_time)
-			ORDER BY (address_id, height)
-		`
-		if err := ch.Conn.Exec(ctx, createTableSQL); err != nil {
-			log.Fatalf("Failed to create table: %v", err)
-		}
-		log.Println("Table created successfully")
-	}
-
 	// Get height range
 	var minHeight, maxHeight uint64
 
@@ -102,11 +82,11 @@ func main() {
 		}
 	}
 
-	log.Printf("Processing blocks from height %d to %d", minHeight, maxHeight)
+	log.Printf("Backfilling block events into account_txs from height %d to %d", minHeight, maxHeight)
 
 	// Load address cache from Postgres
 	addressCache := make(map[string]uint64)
-	addressCacheMu := make(map[string]bool) // Track addresses we've already tried to insert
+	denomCache := make(map[string]uint16)
 
 	getOrCreateAddressID := func(ctx context.Context, address string) (uint64, error) {
 		if id, ok := addressCache[address]; ok {
@@ -142,12 +122,86 @@ func main() {
 		addressCache[address] = id
 		return id, nil
 	}
-	_ = addressCacheMu
+
+	getOrCreateDenomID := func(ctx context.Context, denom string) (uint16, error) {
+		if id, ok := denomCache[denom]; ok {
+			return id, nil
+		}
+
+		var id uint16
+		err := pg.Pool.QueryRow(ctx, "SELECT id FROM denoms WHERE denom = $1", denom).Scan(&id)
+		if err == nil {
+			denomCache[denom] = id
+			return id, nil
+		}
+
+		query := `
+			WITH ins AS (
+				INSERT INTO denoms (denom) VALUES ($1)
+				ON CONFLICT (denom) DO NOTHING
+				RETURNING id
+			)
+			SELECT id FROM ins
+			UNION ALL
+			SELECT id FROM denoms WHERE denom = $1
+			LIMIT 1;
+		`
+
+		err = pg.Pool.QueryRow(ctx, query, denom).Scan(&id)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get or create denom id: %w", err)
+		}
+
+		denomCache[denom] = id
+		return id, nil
+	}
+
+	// Direction keys
+	outKeys := map[string]bool{
+		"sender": true, "spender": true, "from": true, "delegator": true,
+		"proposer": true, "depositor": true, "voter": true, "validator": true,
+	}
+	inKeys := map[string]bool{
+		"recipient": true, "receiver": true, "to": true, "withdraw_address": true,
+	}
+
+	// Parse coins helper
+	parseCoins := func(s string) (string, int64) {
+		// Simple coin parsing: e.g. "1000000uluna" -> ("uluna", 1000000)
+		// Handle comma-separated coins and return the largest
+		var largestDenom string
+		var largestAmount int64
+
+		coins := strings.Split(s, ",")
+		for _, coin := range coins {
+			coin = strings.TrimSpace(coin)
+			if coin == "" {
+				continue
+			}
+			// Find where digits end
+			i := 0
+			for i < len(coin) && (coin[i] >= '0' && coin[i] <= '9') {
+				i++
+			}
+			if i == 0 || i == len(coin) {
+				continue
+			}
+			amountStr := coin[:i]
+			denom := coin[i:]
+			var amount int64
+			fmt.Sscanf(amountStr, "%d", &amount)
+			if amount > largestAmount {
+				largestAmount = amount
+				largestDenom = denom
+			}
+		}
+		return largestDenom, largestAmount
+	}
 
 	// Process in batches
 	currentHeight := minHeight
 	totalProcessed := 0
-	totalAccountBlocks := 0
+	totalAccountTxs := 0
 
 	for currentHeight <= maxHeight {
 		batchEnd := currentHeight + uint64(*batchSize) - 1
@@ -157,9 +211,9 @@ func main() {
 
 		log.Printf("Processing heights %d to %d...", currentHeight, batchEnd)
 
-		// Query events in batch
+		// Query events in batch - get attr_key too for direction and amount extraction
 		query := `
-			SELECT height, block_time, scope, attr_value
+			SELECT height, block_time, scope, attr_key, attr_value
 			FROM events
 			WHERE height >= $1 AND height <= $2
 			  AND scope IN ('begin_block', 'end_block', 'block')
@@ -170,23 +224,43 @@ func main() {
 			log.Fatalf("Failed to query events: %v", err)
 		}
 
-		// Group by height+scope to deduplicate addresses
+		// Group by height+scope, then by address -> info
 		type blockKey struct {
 			Height    uint64
 			BlockTime time.Time
 			Scope     string
 		}
-		blockAddresses := make(map[blockKey]map[string]bool)
+		type addressInfo struct {
+			direction int8
+			denom     string
+			amount    int64
+		}
+		blockData := make(map[blockKey]map[string]*addressInfo)
+		blockAmounts := make(map[blockKey]map[string]int64) // denom -> total amount per block
 
 		for rows.Next() {
 			var height uint64
 			var blockTime time.Time
 			var scope string
+			var attrKey string
 			var attrValue string
 
-			if err := rows.Scan(&height, &blockTime, &scope, &attrValue); err != nil {
+			if err := rows.Scan(&height, &blockTime, &scope, &attrKey, &attrValue); err != nil {
 				log.Printf("Error scanning row: %v", err)
 				continue
+			}
+
+			key := blockKey{Height: height, BlockTime: blockTime, Scope: scope}
+
+			// Track amounts per block
+			if attrKey == "amount" || attrKey == "coins" {
+				if blockAmounts[key] == nil {
+					blockAmounts[key] = make(map[string]int64)
+				}
+				denom, amt := parseCoins(attrValue)
+				if denom != "" {
+					blockAmounts[key][denom] += amt
+				}
 			}
 
 			// Check if this is a Terra address
@@ -194,56 +268,102 @@ func main() {
 				continue
 			}
 
-			key := blockKey{Height: height, BlockTime: blockTime, Scope: scope}
-			if blockAddresses[key] == nil {
-				blockAddresses[key] = make(map[string]bool)
+			if blockData[key] == nil {
+				blockData[key] = make(map[string]*addressInfo)
 			}
-			blockAddresses[key][attrValue] = true
+
+			// Determine direction
+			var direction int8 = 0
+			if outKeys[attrKey] {
+				direction = 2
+			} else if inKeys[attrKey] {
+				direction = 1
+			}
+
+			if existing, ok := blockData[key][attrValue]; ok {
+				if existing.direction == 0 && direction != 0 {
+					existing.direction = direction
+				}
+			} else {
+				blockData[key][attrValue] = &addressInfo{direction: direction}
+			}
 		}
 		rows.Close()
 
-		// Convert to AccountBlocks
-		var accountBlocks []model.AccountBlock
+		// Convert to AccountTxs with is_block_event=true
+		var accountTxs []model.AccountTx
 
-		for key, addresses := range blockAddresses {
-			// Map legacy 'block' scope to 'begin_block'
-			scope := key.Scope
-			if scope == "block" {
-				scope = "begin_block"
+		for key, addresses := range blockData {
+			// Determine event scope as int8
+			var eventScope int8 = model.EventScopeBeginBlock
+			if key.Scope == "end_block" {
+				eventScope = model.EventScopeEndBlock
 			}
 
-			for address := range addresses {
+			// Find largest amount for this block
+			var mainDenom string
+			var mainAmount int64
+			if amounts, ok := blockAmounts[key]; ok {
+				for denom, amt := range amounts {
+					if amt > mainAmount {
+						mainAmount = amt
+						mainDenom = denom
+					}
+				}
+			}
+
+			var mainDenomID uint16
+			if mainDenom != "" {
+				id, err := getOrCreateDenomID(ctx, mainDenom)
+				if err == nil {
+					mainDenomID = id
+				}
+			}
+
+			for address, info := range addresses {
 				addressID, err := getOrCreateAddressID(ctx, address)
 				if err != nil {
 					log.Printf("Failed to get address ID for %s: %v", address, err)
 					continue
 				}
 
-				accountBlocks = append(accountBlocks, model.AccountBlock{
-					AddressID: addressID,
-					Height:    key.Height,
-					BlockTime: key.BlockTime,
-					Scope:     scope,
+				accountTxs = append(accountTxs, model.AccountTx{
+					AddressID:    addressID,
+					Height:       key.Height,
+					IndexInBlock: 0,
+					BlockTime:    key.BlockTime,
+					TxHash:       "",
+					Direction:    info.direction,
+					MainDenomID:  mainDenomID,
+					MainAmount:   mainAmount,
+					IsBlockEvent: true,
+					EventScope:   eventScope,
 				})
 			}
 		}
 
-		// Insert into ClickHouse
-		if len(accountBlocks) > 0 {
-			batch, err := ch.Conn.PrepareBatch(ctx, "INSERT INTO account_blocks")
+		// Insert into ClickHouse account_txs table
+		if len(accountTxs) > 0 {
+			batch, err := ch.Conn.PrepareBatch(ctx, "INSERT INTO account_txs")
 			if err != nil {
 				log.Fatalf("Failed to prepare batch: %v", err)
 			}
 
-			for _, ab := range accountBlocks {
+			for _, at := range accountTxs {
 				err := batch.Append(
-					ab.AddressID,
-					ab.Height,
-					ab.BlockTime,
-					ab.Scope,
+					at.AddressID,
+					at.Height,
+					at.IndexInBlock,
+					at.BlockTime,
+					at.TxHash,
+					at.Direction,
+					at.MainDenomID,
+					at.MainAmount,
+					at.IsBlockEvent,
+					at.EventScope,
 				)
 				if err != nil {
-					log.Printf("Failed to append account_block: %v", err)
+					log.Printf("Failed to append account_tx: %v", err)
 				}
 			}
 
@@ -251,14 +371,14 @@ func main() {
 				log.Fatalf("Failed to send batch: %v", err)
 			}
 
-			totalAccountBlocks += len(accountBlocks)
+			totalAccountTxs += len(accountTxs)
 		}
 
 		totalProcessed += int(batchEnd - currentHeight + 1)
-		log.Printf("Processed %d blocks, inserted %d account_blocks so far", totalProcessed, totalAccountBlocks)
+		log.Printf("Processed %d blocks, inserted %d account_txs so far", totalProcessed, totalAccountTxs)
 
 		currentHeight = batchEnd + 1
 	}
 
-	log.Printf("Backfill complete. Total blocks processed: %d, Total account_blocks inserted: %d", totalProcessed, totalAccountBlocks)
+	log.Printf("Backfill complete. Total blocks processed: %d, Total account_txs inserted: %d", totalProcessed, totalAccountTxs)
 }

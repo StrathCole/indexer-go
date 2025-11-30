@@ -390,43 +390,129 @@ func (s *Service) addAccountTx(
 	}
 }
 
-// extractAccountBlocks extracts all Terra addresses from block-level events (begin_block/end_block)
-// and creates AccountBlock entries for them
-func (s *Service) extractAccountBlocks(
+// extractAccountBlockEvents extracts all Terra addresses from block-level events (begin_block/end_block)
+// and creates AccountTx entries for them with is_block_event=true
+func (s *Service) extractAccountBlockEvents(
 	ctx context.Context,
 	height uint64,
 	blockTime time.Time,
 	scope string,
 	events []abcitypes.Event,
-) ([]model.AccountBlock, error) {
-	// Use a map to deduplicate addresses
-	addressMap := make(map[uint64]bool)
+) ([]model.AccountTx, error) {
+	// Track address -> (direction, amount) for each address found
+	type addressInfo struct {
+		direction int8
+		amount    sdk.Coins
+	}
+	addressMap := make(map[uint64]*addressInfo)
 
-	// Extract all addresses from all events
+	// Define which attribute keys indicate direction
+	outKeys := map[string]bool{
+		"sender": true, "spender": true, "from": true, "delegator": true,
+		"proposer": true, "depositor": true, "voter": true, "validator": true,
+	}
+	inKeys := map[string]bool{
+		"recipient": true, "receiver": true, "to": true, "withdraw_address": true,
+	}
+
+	// Extract addresses and amounts from all events
 	for _, event := range events {
+		var eventAmount sdk.Coins
+
+		// First pass: find amount in this event
 		for _, attr := range event.Attributes {
+			key := string(attr.Key)
 			value := string(attr.Value)
-			if isTerraAddress(value) {
-				addressID, err := s.dims.GetOrCreateAddressID(ctx, value)
-				if err == nil {
-					addressMap[addressID] = true
+			if key == "amount" || key == "coins" {
+				coins, err := sdk.ParseCoinsNormalized(value)
+				if err == nil && len(coins) > 0 {
+					eventAmount = coins
+				}
+			}
+		}
+
+		// Second pass: find addresses and associate with amount
+		for _, attr := range event.Attributes {
+			key := string(attr.Key)
+			value := string(attr.Value)
+
+			if !isTerraAddress(value) {
+				continue
+			}
+
+			addressID, err := s.dims.GetOrCreateAddressID(ctx, value)
+			if err != nil {
+				continue
+			}
+
+			// Determine direction based on attribute key
+			var direction int8 = 0
+			if outKeys[key] {
+				direction = 2 // out
+			} else if inKeys[key] {
+				direction = 1 // in
+			}
+
+			if existing, ok := addressMap[addressID]; ok {
+				// Update direction if we have a more specific one
+				if existing.direction == 0 && direction != 0 {
+					existing.direction = direction
+				}
+				// Add to amount if this event has coins
+				if len(eventAmount) > 0 {
+					existing.amount = existing.amount.Add(eventAmount...)
+				}
+			} else {
+				addressMap[addressID] = &addressInfo{
+					direction: direction,
+					amount:    eventAmount,
 				}
 			}
 		}
 	}
 
-	// Convert map to slice
-	var accountBlocks []model.AccountBlock
-	for addressID := range addressMap {
-		accountBlocks = append(accountBlocks, model.AccountBlock{
-			AddressID: addressID,
-			Height:    height,
-			BlockTime: blockTime,
-			Scope:     scope,
+	// Determine event scope
+	var eventScope int8 = model.EventScopeBeginBlock
+	if scope == "end_block" {
+		eventScope = model.EventScopeEndBlock
+	}
+
+	// Convert map to slice of AccountTx
+	var accountTxs []model.AccountTx
+	for addressID, info := range addressMap {
+		var mainDenomID uint16
+		var mainAmount int64
+
+		if len(info.amount) > 0 {
+			// Use the largest coin as main amount
+			largestCoin := info.amount[0]
+			for _, coin := range info.amount {
+				if coin.Amount.GT(largestCoin.Amount) {
+					largestCoin = coin
+				}
+			}
+			mainAmount = largestCoin.Amount.Int64()
+			id, err := s.dims.GetOrCreateDenomID(ctx, largestCoin.Denom)
+			if err == nil {
+				mainDenomID = id
+			}
+		}
+
+		accountTxs = append(accountTxs, model.AccountTx{
+			AddressID:    addressID,
+			Height:       height,
+			IndexInBlock: 0, // Not relevant for block events
+			BlockTime:    blockTime,
+			TxHash:       "", // Empty for block events
+			Direction:    info.direction,
+			MainDenomID:  mainDenomID,
+			MainAmount:   mainAmount,
+			IsBlockEvent: true,
+			EventScope:   eventScope,
 		})
 	}
 
-	return accountBlocks, nil
+	return accountTxs, nil
 }
 
 func (s *Service) convertBlockEvents(

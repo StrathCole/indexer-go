@@ -51,6 +51,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
 ORDER BY (event_type, attr_key, height, tx_index, event_index);
 
+-- Account activity tracking for both transactions and block events
 CREATE TABLE IF NOT EXISTS account_txs (
     address_id      UInt64,
     height          UInt64,
@@ -59,22 +60,13 @@ CREATE TABLE IF NOT EXISTS account_txs (
     tx_hash         FixedString(64),
     direction       Int8, -- 0: unknown, 1: in, 2: out
     main_denom_id   UInt16,
-    main_amount     Int64
+    main_amount     Int64,
+    is_block_event  Bool DEFAULT false,
+    event_scope     Int8 DEFAULT 0 -- 0: tx, 1: begin_block, 2: end_block
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
-ORDER BY (address_id, height, index_in_block);
-
--- Account-Block relations for addresses found in begin_block and end_block events
-CREATE TABLE IF NOT EXISTS account_blocks (
-    address_id      UInt64,
-    height          UInt64,
-    block_time      DateTime64(3),
-    scope           Enum8('begin_block' = 0, 'end_block' = 1)
-)
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(block_time)
-ORDER BY (address_id, height);
+ORDER BY (address_id, height, index_in_block, is_block_event);
 
 -- New table for Oracle Prices (Time Series)
 CREATE TABLE IF NOT EXISTS oracle_prices (
