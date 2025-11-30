@@ -65,6 +65,17 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
 ORDER BY (address_id, height, index_in_block);
 
+-- Account-Block relations for addresses found in begin_block and end_block events
+CREATE TABLE IF NOT EXISTS account_blocks (
+    address_id      UInt64,
+    height          UInt64,
+    block_time      DateTime64(3),
+    scope           Enum8('begin_block' = 0, 'end_block' = 1)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(block_time)
+ORDER BY (address_id, height);
+
 -- New table for Oracle Prices (Time Series)
 CREATE TABLE IF NOT EXISTS oracle_prices (
     block_time      DateTime64(3),

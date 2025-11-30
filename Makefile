@@ -1,8 +1,8 @@
-.PHONY: all build build-ingest build-api clean run-ingest run-api test lint
+.PHONY: all build build-ingest build-api build-tools clean run-ingest run-api test lint
 
 all: build
 
-build: build-ingest build-api
+build: build-ingest build-api build-tools
 
 build-ingest:
 	@mkdir -p build
@@ -11,6 +11,12 @@ build-ingest:
 build-api:
 	@mkdir -p build
 	go build -o build/indexer-api ./cmd/indexer-api
+
+build-tools:
+	@mkdir -p build
+	go build -o build/fix_tax ./cmd/tools/fix_tax
+	go build -o build/fix_timestamps ./cmd/tools/fix_timestamps
+	go build -o build/backfill_account_blocks ./cmd/tools/backfill_account_blocks
 
 clean:
 	rm -rf build

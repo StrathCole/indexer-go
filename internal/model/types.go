@@ -60,6 +60,15 @@ type AccountTx struct {
 	MainAmount   int64     `ch:"main_amount"`
 }
 
+// AccountBlock represents an account-block relation in ClickHouse
+// This tracks addresses found in begin_block and end_block events
+type AccountBlock struct {
+	AddressID uint64    `ch:"address_id"`
+	Height    uint64    `ch:"height"`
+	BlockTime time.Time `ch:"block_time"`
+	Scope     string    `ch:"scope"` // 'begin_block' or 'end_block'
+}
+
 // OraclePrice represents an oracle price in ClickHouse
 type OraclePrice struct {
 	BlockTime time.Time `ch:"block_time"`

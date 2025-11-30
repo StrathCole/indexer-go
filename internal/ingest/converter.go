@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/classic-terra/core/v3/app"
@@ -232,6 +233,70 @@ func (s *Service) convertTx(
 	return modelTx, events, accountTxs, nil
 }
 
+// isTerraAddress checks if a string is a valid Terra address (terra1... bech32)
+// Returns false for terravaloper addresses as they are not relevant for account tracking
+func isTerraAddress(s string) bool {
+	// Must start with "terra1" and be a reasonable length (39-59 chars for bech32)
+	if len(s) < 39 || len(s) > 64 {
+		return false
+	}
+	// Exclude terravaloper addresses
+	if strings.HasPrefix(s, "terravaloper") {
+		return false
+	}
+	// Check for terra1 prefix (accounts and contracts)
+	return strings.HasPrefix(s, "terra1")
+}
+
+// extractAddressesFromEvents scans all event attributes for Terra addresses
+// Returns a map of address -> direction (used for determining in/out/neutral)
+func (s *Service) extractAddressesFromEvents(events []abcitypes.Event) map[string]int8 {
+	addresses := make(map[string]int8)
+
+	// Define which attribute keys indicate direction
+	outKeys := map[string]bool{
+		"sender": true, "spender": true, "from": true, "trader": true,
+		"delegator": true, "proposer": true, "depositor": true, "voter": true,
+		"granter": true, "creator": true, "owner": true, "admin": true,
+		"sender_address": true, "from_address": true,
+	}
+	inKeys := map[string]bool{
+		"recipient": true, "receiver": true, "to": true, "to_address": true,
+		"grantee": true, "recipient_address": true,
+	}
+
+	for _, event := range events {
+		for _, attr := range event.Attributes {
+			key := string(attr.Key)
+			value := string(attr.Value)
+
+			if !isTerraAddress(value) {
+				continue
+			}
+
+			// Determine direction based on attribute key
+			var direction int8 = 0 // neutral
+			if outKeys[key] {
+				direction = 2 // out
+			} else if inKeys[key] {
+				direction = 1 // in
+			}
+
+			// If we already have this address, prefer a non-neutral direction
+			if existing, ok := addresses[value]; ok {
+				if existing == 0 && direction != 0 {
+					addresses[value] = direction
+				}
+				// If existing is non-zero, keep it (first meaningful direction wins)
+			} else {
+				addresses[value] = direction
+			}
+		}
+	}
+
+	return addresses
+}
+
 func (s *Service) extractAccountTxs(
 	ctx context.Context,
 	height uint64,
@@ -242,121 +307,35 @@ func (s *Service) extractAccountTxs(
 ) ([]model.AccountTx, error) {
 	accountTxsMap := make(map[uint64]*model.AccountTx)
 
+	// First, extract main amount from transfer events for context
+	var mainAmount sdk.Coins
 	for _, event := range events {
-		// Handle various event types to capture account activity
-
-		// 1. Transfer
 		if event.Type == "transfer" {
-			var sender, recipient string
-			var amount sdk.Coins
-
 			for _, attr := range event.Attributes {
-				key := string(attr.Key)
-				value := string(attr.Value)
-
-				switch key {
-				case "sender":
-					sender = value
-				case "recipient":
-					recipient = value
-				case "amount":
-					amount, _ = sdk.ParseCoinsNormalized(value)
+				if string(attr.Key) == "amount" {
+					coins, err := sdk.ParseCoinsNormalized(string(attr.Value))
+					if err == nil && len(coins) > 0 {
+						mainAmount = coins
+						break
+					}
 				}
 			}
-
-			if sender != "" {
-				senderID, err := s.dims.GetOrCreateAddressID(ctx, sender)
-				if err == nil {
-					s.addAccountTx(ctx, accountTxsMap, senderID, height, index, blockTime, txHash, 2, amount) // 2: Out
-				}
-			}
-
-			if recipient != "" {
-				recipientID, err := s.dims.GetOrCreateAddressID(ctx, recipient)
-				if err == nil {
-					s.addAccountTx(ctx, accountTxsMap, recipientID, height, index, blockTime, txHash, 1, amount) // 1: In
-				}
+			if len(mainAmount) > 0 {
+				break
 			}
 		}
+	}
 
-		// 2. Message (Sender)
-		if event.Type == "message" {
-			var sender string
-			for _, attr := range event.Attributes {
-				if string(attr.Key) == "sender" {
-					sender = string(attr.Value)
-					break
-				}
-			}
-			if sender != "" {
-				senderID, err := s.dims.GetOrCreateAddressID(ctx, sender)
-				if err == nil {
-					// Direction 0 or 2? Usually sender pays fees, so it's an action.
-					// FCD marks this as 'out' usually if it involves funds, or just 'action'.
-					// We use 2 (Out) as default for sender.
-					s.addAccountTx(ctx, accountTxsMap, senderID, height, index, blockTime, txHash, 2, nil)
-				}
-			}
+	// Extract all addresses from all events
+	addressDirections := s.extractAddressesFromEvents(events)
+
+	// Create AccountTx entries for each unique address
+	for address, direction := range addressDirections {
+		addressID, err := s.dims.GetOrCreateAddressID(ctx, address)
+		if err != nil {
+			continue
 		}
-
-		// 3. Delegate / Unbond / Withdraw Rewards
-		if event.Type == "delegate" || event.Type == "unbond" || event.Type == "withdraw_rewards" {
-			var validator string
-			var amount sdk.Coins
-
-			for _, attr := range event.Attributes {
-				key := string(attr.Key)
-				value := string(attr.Value)
-				switch key {
-				case "validator":
-					validator = value
-				case "amount":
-					amount, _ = sdk.ParseCoinsNormalized(value)
-				}
-			}
-
-			// Note: delegator is usually in 'message' event as sender, but sometimes in specific events.
-			// In 'delegate', 'unbond', 'withdraw_rewards', the user is the sender of the msg.
-			// So 'message' handler above catches the user.
-			// But we might want to capture the validator interaction too?
-			// FCD usually indexes the validator address too if it's relevant.
-			if validator != "" {
-				valID, err := s.dims.GetOrCreateAddressID(ctx, validator)
-				if err == nil {
-					s.addAccountTx(ctx, accountTxsMap, valID, height, index, blockTime, txHash, 0, amount) // 0: Neutral/Info
-				}
-			}
-		}
-
-		// 4. Swap (Terra specific)
-		if event.Type == "swap" {
-			var trader, offerAsset, askAsset string
-			// var offerAmount, askAmount sdk.Coin
-
-			for _, attr := range event.Attributes {
-				key := string(attr.Key)
-				value := string(attr.Value)
-				switch key {
-				case "trader":
-					trader = value
-				case "offer_asset":
-					offerAsset = value
-				case "ask_asset":
-					askAsset = value
-				}
-			}
-
-			if trader != "" {
-				traderID, err := s.dims.GetOrCreateAddressID(ctx, trader)
-				if err == nil {
-					// Swap involves both in and out.
-					// We just mark it.
-					_ = offerAsset
-					_ = askAsset
-					s.addAccountTx(ctx, accountTxsMap, traderID, height, index, blockTime, txHash, 2, nil)
-				}
-			}
-		}
+		s.addAccountTx(ctx, accountTxsMap, addressID, height, index, blockTime, txHash, direction, mainAmount)
 	}
 
 	var accountTxs []model.AccountTx
@@ -409,6 +388,45 @@ func (s *Service) addAccountTx(
 			MainAmount:   mainAmount,
 		}
 	}
+}
+
+// extractAccountBlocks extracts all Terra addresses from block-level events (begin_block/end_block)
+// and creates AccountBlock entries for them
+func (s *Service) extractAccountBlocks(
+	ctx context.Context,
+	height uint64,
+	blockTime time.Time,
+	scope string,
+	events []abcitypes.Event,
+) ([]model.AccountBlock, error) {
+	// Use a map to deduplicate addresses
+	addressMap := make(map[uint64]bool)
+
+	// Extract all addresses from all events
+	for _, event := range events {
+		for _, attr := range event.Attributes {
+			value := string(attr.Value)
+			if isTerraAddress(value) {
+				addressID, err := s.dims.GetOrCreateAddressID(ctx, value)
+				if err == nil {
+					addressMap[addressID] = true
+				}
+			}
+		}
+	}
+
+	// Convert map to slice
+	var accountBlocks []model.AccountBlock
+	for addressID := range addressMap {
+		accountBlocks = append(accountBlocks, model.AccountBlock{
+			AddressID: addressID,
+			Height:    height,
+			BlockTime: blockTime,
+			Scope:     scope,
+		})
+	}
+
+	return accountBlocks, nil
 }
 
 func (s *Service) convertBlockEvents(

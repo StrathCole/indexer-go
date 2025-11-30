@@ -13,6 +13,7 @@ func (s *Service) BatchInsert(
 	txs []model.Tx,
 	events []model.Event,
 	accountTxs []model.AccountTx,
+	accountBlocks []model.AccountBlock,
 	oraclePrices []model.OraclePrice,
 	validatorReturns []model.ValidatorReturn,
 	blockRewards []model.BlockReward,
@@ -100,6 +101,27 @@ func (s *Service) BatchInsert(
 		}
 		if err := batch.Send(); err != nil {
 			return fmt.Errorf("failed to send account_txs batch: %w", err)
+		}
+	}
+
+	if len(accountBlocks) > 0 {
+		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO account_blocks")
+		if err != nil {
+			return fmt.Errorf("failed to prepare account_blocks batch: %w", err)
+		}
+		for _, ab := range accountBlocks {
+			err := batch.Append(
+				ab.AddressID,
+				ab.Height,
+				ab.BlockTime,
+				ab.Scope,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to append account_block: %w", err)
+			}
+		}
+		if err := batch.Send(); err != nil {
+			return fmt.Errorf("failed to send account_blocks batch: %w", err)
 		}
 	}
 

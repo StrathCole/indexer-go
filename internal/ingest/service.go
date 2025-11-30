@@ -528,6 +528,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelTxs []model.Tx
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
+	var modelAccountBlocks []model.AccountBlock
 
 	// Convert Block Events (BeginBlock & EndBlock)
 	beginBlockEvents := s.convertBlockEvents(
@@ -545,6 +546,33 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 
 	modelEvents = append(modelEvents, beginBlockEvents...)
 	modelEvents = append(modelEvents, endBlockEvents...)
+
+	// Extract account-block relations from block events
+	beginAccountBlocks, err := s.extractAccountBlocks(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		results.BeginBlockEvents,
+	)
+	if err != nil {
+		log.Printf("Failed to extract begin_block account relations: %v", err)
+	} else {
+		modelAccountBlocks = append(modelAccountBlocks, beginAccountBlocks...)
+	}
+
+	endAccountBlocks, err := s.extractAccountBlocks(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"end_block",
+		results.EndBlockEvents,
+	)
+	if err != nil {
+		log.Printf("Failed to extract end_block account relations: %v", err)
+	} else {
+		modelAccountBlocks = append(modelAccountBlocks, endAccountBlocks...)
+	}
 
 	for i, txBytes := range block.Block.Txs {
 		decodedTx, err := txDecoder(txBytes)
@@ -574,7 +602,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	}
 
 	// Insert everything in one batch
-	err := s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, oraclePrices, validatorReturns, blockRewards)
+	err = s.BatchInsert(context.Background(), []model.Block{modelBlock}, modelTxs, modelEvents, modelAccountTxs, modelAccountBlocks, oraclePrices, validatorReturns, blockRewards)
 	if err != nil {
 		log.Printf("Failed to insert block/txs: %v", err)
 		return err
