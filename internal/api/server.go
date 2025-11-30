@@ -74,6 +74,7 @@ func (s *Server) Router() http.Handler {
 	// Blocks
 	v1.HandleFunc("/blocks/latest", s.GetBlockLatest).Methods("GET")
 	v1.HandleFunc("/blocks/{height}", s.GetBlock).Methods("GET")
+	v1.HandleFunc("/blocks/{height}/events", s.GetBlockEvents).Methods("GET")
 
 	// Bank
 	v1.HandleFunc("/bank/{account}", s.GetBalances).Methods("GET")

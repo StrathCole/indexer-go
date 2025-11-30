@@ -393,6 +393,119 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 	s.respondBlock(w, block)
 }
 
+// GetBlockEvents returns block events for a specific height, optionally filtered by account
+// GET /v1/blocks/{height}/events?account=terra1...&scope=begin_block|end_block
+func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	heightStr := vars["height"]
+	height, err := strconv.ParseUint(heightStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid height")
+		return
+	}
+
+	queryParams := r.URL.Query()
+	account := strings.TrimSpace(queryParams.Get("account"))
+	scope := strings.TrimSpace(queryParams.Get("scope")) // "begin_block" or "end_block"
+
+	// Build scope filter
+	var scopeFilter string
+	if scope == "begin_block" {
+		scopeFilter = "AND scope = 'begin_block'"
+	} else if scope == "end_block" {
+		scopeFilter = "AND scope = 'end_block'"
+	} else {
+		// Include both begin_block and end_block (and legacy 'block')
+		scopeFilter = "AND scope IN ('begin_block', 'end_block', 'block')"
+	}
+
+	// Query events
+	sql := fmt.Sprintf(`SELECT * FROM events WHERE height = ? %s ORDER BY scope ASC, event_index ASC`, scopeFilter)
+	var dbEvents []model.Event
+	err = s.ch.Conn.Select(context.Background(), &dbEvents, sql, height)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch events: %v", err))
+		return
+	}
+
+	// If account filter is provided, filter events to only those involving this address
+	if account != "" {
+		var filteredEvents []model.Event
+		var relevantEventIndices = make(map[string]bool) // scope+event_index -> bool
+
+		// First pass: find events that involve this account
+		for _, ev := range dbEvents {
+			if ev.AttrValue == account {
+				key := fmt.Sprintf("%s-%d", ev.Scope, ev.EventIndex)
+				relevantEventIndices[key] = true
+			}
+		}
+
+		// Second pass: include all attributes of relevant events
+		for _, ev := range dbEvents {
+			key := fmt.Sprintf("%s-%d", ev.Scope, ev.EventIndex)
+			if relevantEventIndices[key] {
+				filteredEvents = append(filteredEvents, ev)
+			}
+		}
+
+		dbEvents = filteredEvents
+	}
+
+	// Group events by (scope, event_index)
+	var events []map[string]interface{}
+	var currentEvent map[string]interface{}
+	var currentAttrs []map[string]string
+
+	lastScope := ""
+	lastEventIndex := uint16(65535)
+
+	for _, row := range dbEvents {
+		isNewEvent := row.Scope != lastScope || row.EventIndex != lastEventIndex
+
+		if isNewEvent {
+			if currentEvent != nil {
+				currentEvent["attributes"] = currentAttrs
+				events = append(events, currentEvent)
+			}
+
+			// Normalize scope name
+			scopeName := row.Scope
+			if scopeName == "block" {
+				scopeName = "begin_block"
+			}
+
+			currentEvent = map[string]interface{}{
+				"type":  row.EventType,
+				"scope": scopeName,
+			}
+			currentAttrs = []map[string]string{}
+
+			lastScope = row.Scope
+			lastEventIndex = row.EventIndex
+		}
+
+		currentAttrs = append(currentAttrs, map[string]string{
+			"key":   row.AttrKey,
+			"value": row.AttrValue,
+		})
+	}
+	// Append last event
+	if currentEvent != nil {
+		currentEvent["attributes"] = currentAttrs
+		events = append(events, currentEvent)
+	}
+
+	if events == nil {
+		events = []map[string]interface{}{}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"height": height,
+		"events": events,
+	})
+}
+
 func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	// Fetch Txs for this block
 	var txs []model.Tx
