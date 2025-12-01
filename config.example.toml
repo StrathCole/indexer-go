@@ -18,6 +18,7 @@ grpc = "localhost:9090"
 block_poll_interval = "1s"
 backfill_interval = "0s" # Delay between backfill batches (0s = fast as possible)
 backfill_batch_size = 10 # Number of blocks to fetch per batch
+backfill_workers = 5     # Number of parallel workers for backfill (0 = auto, based on batch_size/10, max 8)
 richlist_update_interval = "1h"
 start_height = 0 # Set to > 0 to start indexing from a specific height (e.g. 25616144)
 end_height = 0   # Set to > 0 to stop indexing at a specific height

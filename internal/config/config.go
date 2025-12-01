@@ -44,6 +44,7 @@ type IngestConfig struct {
 	BlockPollInterval      time.Duration `mapstructure:"block_poll_interval"`
 	BackfillInterval       time.Duration `mapstructure:"backfill_interval"`
 	BackfillBatchSize      int64         `mapstructure:"backfill_batch_size"`
+	BackfillWorkers        int           `mapstructure:"backfill_workers"`
 	RichlistUpdateInterval time.Duration `mapstructure:"richlist_update_interval"`
 	StartHeight            int64         `mapstructure:"start_height"`
 	EndHeight              int64         `mapstructure:"end_height"`
@@ -66,6 +67,7 @@ func LoadConfig(path string) (*Config, error) {
 	v.SetDefault("ingest.block_poll_interval", "1s")
 	v.SetDefault("ingest.backfill_interval", "0s")
 	v.SetDefault("ingest.backfill_batch_size", 10)
+	v.SetDefault("ingest.backfill_workers", 5) // 0 = auto-calculate based on batch size
 	v.SetDefault("ingest.richlist_update_interval", "1h")
 	v.SetDefault("ingest.start_height", 0)
 	v.SetDefault("ingest.end_height", 0)

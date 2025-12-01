@@ -29,8 +29,8 @@ func NewClickHouse(addr string, database string, username string, password strin
 			Method: clickhouse.CompressionLZ4,
 		},
 		DialTimeout:     time.Second * 30,
-		MaxOpenConns:    5,
-		MaxIdleConns:    5,
+		MaxOpenConns:    20,  // Increased from 5 to support parallel backfill
+		MaxIdleConns:    10,  // Increased from 5
 		ConnMaxLifetime: time.Duration(10) * time.Minute,
 	})
 
@@ -179,4 +179,43 @@ func (ch *ClickHouse) GetMaxHeightInRange(ctx context.Context, start, end int64)
 		return 0, err
 	}
 	return int64(height), nil
+}
+
+// GetExistingHeightsInRange returns a set of existing block heights in the given range
+func (ch *ClickHouse) GetExistingHeightsInRange(ctx context.Context, start, end int64) (map[int64]bool, error) {
+	result := make(map[int64]bool)
+	
+	rows, err := ch.Conn.Query(ctx, "SELECT height FROM blocks WHERE height >= $1 AND height <= $2", start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var height uint64
+		if err := rows.Scan(&height); err != nil {
+			return nil, err
+		}
+		result[int64(height)] = true
+	}
+	
+	return result, nil
+}
+
+// FindGapsInRange returns a slice of missing block heights in the given range
+func (ch *ClickHouse) FindGapsInRange(ctx context.Context, start, end int64, limit int) ([]int64, error) {
+	// Get existing heights
+	existing, err := ch.GetExistingHeightsInRange(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	
+	var gaps []int64
+	for h := start; h <= end && len(gaps) < limit; h++ {
+		if !existing[h] {
+			gaps = append(gaps, h)
+		}
+	}
+	
+	return gaps, nil
 }

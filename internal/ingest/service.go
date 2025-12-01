@@ -52,9 +52,12 @@ type Service struct {
 	endHeight         int64
 	fillGaps          bool
 	backfillCursor    int64
+
+	// Concurrency settings for backfill
+	backfillWorkers int
 }
 
-func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC string, blockPollInterval time.Duration, backfillInterval time.Duration, backfillBatchSize int64, richlistInterval time.Duration, startHeight int64, endHeight int64, fillGaps bool) (*Service, error) {
+func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC string, blockPollInterval time.Duration, backfillInterval time.Duration, backfillBatchSize int64, backfillWorkers int, richlistInterval time.Duration, startHeight int64, endHeight int64, fillGaps bool) (*Service, error) {
 	// Initialize the encoding config
 	encCfg := app.MakeEncodingConfig()
 
@@ -131,6 +134,19 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		WithClient(rpcClient).
 		WithGRPCClient(grpcConn)
 
+	// Determine number of workers based on batch size (cap at 8 to avoid overwhelming RPC)
+	workers := backfillWorkers
+	if workers <= 0 {
+		// Auto-calculate based on batch size
+		workers = int(backfillBatchSize / 10)
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > 8 {
+			workers = 8
+		}
+	}
+
 	return &Service{
 		ch:                ch,
 		pg:                pg,
@@ -148,6 +164,7 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		endHeight:         endHeight,
 		fillGaps:          fillGaps,
 		backfillCursor:    startHeight,
+		backfillWorkers:   workers,
 	}, nil
 }
 
@@ -332,8 +349,8 @@ func (s *Service) startBackfillIngest(ctx context.Context) {
 func (s *Service) backfillStep(ctx context.Context) bool {
 	// Strategy:
 	// 1. Get latest height from RPC (target)
-	// 2. Determine startBlock based on mode (FillGaps vs Append)
-	// 3. Process batch
+	// 2. Determine blocks to process based on mode (FillGaps vs Append)
+	// 3. Process batch in parallel with worker pool
 
 	rpc := s.getRPC()
 	if rpc == nil {
@@ -348,7 +365,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 	}
 	latestHeight := status.SyncInfo.LatestBlockHeight
 
-	var startBlock int64
+	var blocksToProcess []int64
 
 	if s.fillGaps {
 		if s.backfillCursor == 0 {
@@ -363,6 +380,10 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 		chunkSize := int64(10000)
 		for s.backfillCursor < latestHeight {
 			endRange := s.backfillCursor + chunkSize
+			if endRange > latestHeight {
+				endRange = latestHeight
+			}
+
 			// Check if chunk is full
 			count, err := s.ch.CountBlocksInRange(ctx, s.backfillCursor, endRange)
 			if err != nil {
@@ -371,40 +392,40 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 			}
 
 			expected := endRange - s.backfillCursor
-			// If we are near the tip, expected count might be less if blocks are not produced yet?
-			// But latestHeight is fixed for this step.
-			if endRange > latestHeight {
-				expected = latestHeight - s.backfillCursor + 1
-			}
-
 			if count >= expected {
 				// Chunk is full, skip it
 				s.backfillCursor = endRange
 				continue
-			} else {
-				// Gap is in this chunk
-				// Use FindNextGap restricted to this chunk
-				nextGap, err := s.ch.FindNextGap(ctx, s.backfillCursor, endRange)
-				if err != nil {
-					log.Printf("Backfill: Failed to find next gap: %v", err)
-				} else if nextGap > 0 {
-					s.backfillCursor = nextGap
-				} else {
-					// No internal gap found, but count mismatch.
-					// This means the gap is at the end of the chunk (tail gap).
-					// Find max height in this range to skip the contiguous block.
-					maxH, err := s.ch.GetMaxHeightInRange(ctx, s.backfillCursor, endRange)
-					if err == nil && maxH > 0 {
-						s.backfillCursor = maxH + 1
-					}
-				}
+			}
+
+			// Found a chunk with gaps - find the missing blocks
+			batchSize := int(s.backfillBatchSize)
+			if batchSize <= 0 {
+				batchSize = 10
+			}
+
+			gaps, err := s.ch.FindGapsInRange(ctx, s.backfillCursor, endRange, batchSize)
+			if err != nil {
+				log.Printf("Backfill: Failed to find gaps: %v", err)
 				break
 			}
+
+			if len(gaps) > 0 {
+				blocksToProcess = gaps
+				// Update cursor to after the last gap we're processing
+				s.backfillCursor = gaps[len(gaps)-1] + 1
+			} else {
+				// No gaps found but count mismatch - move to next chunk
+				s.backfillCursor = endRange
+			}
+			break
 		}
 
-		startBlock = s.backfillCursor
+		if len(blocksToProcess) == 0 && s.backfillCursor >= latestHeight {
+			return true // Synced
+		}
 	} else {
-		// If backfillCursor is not set (0), initialize it from DB
+		// Append mode - process consecutive blocks
 		if s.backfillCursor == 0 {
 			maxHeight, err := s.ch.GetMaxHeight(ctx)
 			if err != nil {
@@ -422,47 +443,305 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 				s.backfillCursor = maxHeight + 1
 			}
 		}
-		startBlock = s.backfillCursor
-	}
 
-	if startBlock > latestHeight {
-		// Synced
-		return true
-	}
-
-	// Process a batch or single block
-	// Let's process up to backfillBatchSize blocks per tick to catch up faster, but respect rate limits
-	batchSize := s.backfillBatchSize
-	if batchSize <= 0 {
-		batchSize = 10
-	}
-	endBlock := startBlock + int64(batchSize) - 1
-	if endBlock > latestHeight {
-		endBlock = latestHeight
-	}
-
-	log.Printf("Backfill: Syncing range %d to %d (FillGaps: %v)", startBlock, endBlock, s.fillGaps)
-
-	for h := startBlock; h <= endBlock; h++ {
-		// Check if exists (Live ingest might have caught it)
-		exists, err := s.ch.BlockExists(ctx, h)
-		if err != nil {
-			log.Printf("Backfill: Failed to check block %d: %v", h, err)
-			break
+		if s.backfillCursor > latestHeight {
+			return true // Synced
 		}
-		if exists {
+
+		batchSize := s.backfillBatchSize
+		if batchSize <= 0 {
+			batchSize = 10
+		}
+		endBlock := s.backfillCursor + batchSize - 1
+		if endBlock > latestHeight {
+			endBlock = latestHeight
+		}
+
+		// Get existing heights to skip already processed blocks
+		existing, err := s.ch.GetExistingHeightsInRange(ctx, s.backfillCursor, endBlock)
+		if err != nil {
+			log.Printf("Backfill: Failed to check existing blocks: %v", err)
+			return true
+		}
+
+		for h := s.backfillCursor; h <= endBlock; h++ {
+			if !existing[h] {
+				blocksToProcess = append(blocksToProcess, h)
+			}
+		}
+
+		s.backfillCursor = endBlock + 1
+	}
+
+	if len(blocksToProcess) == 0 {
+		return false // Not synced but no blocks to process in this batch
+	}
+
+	log.Printf("Backfill: Processing %d blocks (%d to %d, FillGaps: %v, Workers: %d)",
+		len(blocksToProcess), blocksToProcess[0], blocksToProcess[len(blocksToProcess)-1], s.fillGaps, s.backfillWorkers)
+
+	// Process blocks in parallel using worker pool
+	s.processBlocksParallel(ctx, blocksToProcess)
+
+	return false // Not synced yet
+}
+
+// processBlocksParallel processes multiple blocks concurrently using a worker pool
+func (s *Service) processBlocksParallel(ctx context.Context, heights []int64) {
+	if len(heights) == 0 {
+		return
+	}
+
+	numWorkers := s.backfillWorkers
+	if numWorkers > len(heights) {
+		numWorkers = len(heights)
+	}
+
+	// Channel to distribute work
+	heightChan := make(chan int64, len(heights))
+	for _, h := range heights {
+		heightChan <- h
+	}
+	close(heightChan)
+
+	// Channel to collect results (block data + converted models)
+	type blockResult struct {
+		height           int64
+		block            model.Block
+		txs              []model.Tx
+		events           []model.Event
+		accountTxs       []model.AccountTx
+		oraclePrices     []model.OraclePrice
+		validatorReturns []model.ValidatorReturn
+		blockRewards     []model.BlockReward
+		err              error
+	}
+	resultChan := make(chan blockResult, len(heights))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for height := range heightChan {
+				result := blockResult{height: height}
+
+				// Fetch and process block
+				block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.fetchAndConvertBlock(height)
+				if err != nil {
+					result.err = err
+				} else {
+					result.block = block
+					result.txs = txs
+					result.events = events
+					result.accountTxs = accountTxs
+					result.oraclePrices = oraclePrices
+					result.validatorReturns = validatorReturns
+					result.blockRewards = blockRewards
+				}
+
+				resultChan <- result
+			}
+		}()
+	}
+
+	// Wait for all workers to finish
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results and batch insert
+	// We collect all successful results first, then batch insert to maintain order integrity
+	var allBlocks []model.Block
+	var allTxs []model.Tx
+	var allEvents []model.Event
+	var allAccountTxs []model.AccountTx
+	var allOraclePrices []model.OraclePrice
+	var allValidatorReturns []model.ValidatorReturn
+	var allBlockRewards []model.BlockReward
+
+	for result := range resultChan {
+		if result.err != nil {
+			log.Printf("Backfill: Failed to process block %d: %v", result.height, result.err)
 			continue
 		}
 
-		if err := s.ProcessBlock(h); err != nil {
-			log.Printf("Backfill: Failed to process block %d: %v", h, err)
+		allBlocks = append(allBlocks, result.block)
+		allTxs = append(allTxs, result.txs...)
+		allEvents = append(allEvents, result.events...)
+		allAccountTxs = append(allAccountTxs, result.accountTxs...)
+		allOraclePrices = append(allOraclePrices, result.oraclePrices...)
+		allValidatorReturns = append(allValidatorReturns, result.validatorReturns...)
+		allBlockRewards = append(allBlockRewards, result.blockRewards...)
+	}
+
+	// Batch insert all collected data
+	if len(allBlocks) > 0 {
+		err := s.BatchInsert(ctx, allBlocks, allTxs, allEvents, allAccountTxs, allOraclePrices, allValidatorReturns, allBlockRewards)
+		if err != nil {
+			log.Printf("Backfill: Failed to batch insert: %v", err)
+		}
+	}
+}
+
+// fetchAndConvertBlock fetches a block from RPC and converts it to model types
+func (s *Service) fetchAndConvertBlock(height int64) (
+	model.Block,
+	[]model.Tx,
+	[]model.Event,
+	[]model.AccountTx,
+	[]model.OraclePrice,
+	[]model.ValidatorReturn,
+	[]model.BlockReward,
+	error,
+) {
+	var block *coretypes.ResultBlock
+	var results *coretypes.ResultBlockResults
+	var err error
+
+	rpc := s.getRPC()
+	if rpc == nil {
+		return model.Block{}, nil, nil, nil, nil, nil, nil, fmt.Errorf("RPC client not available")
+	}
+
+	// Retry fetching block and results with exponential backoff for rate limiting
+	maxRetries := 10
+	baseRetryInterval := 500 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		block, err = rpc.Block(context.Background(), &height)
+		if err == nil {
+			results, err = rpc.BlockResults(context.Background(), &height)
+		}
+
+		if err == nil {
 			break
+		}
+
+		// Check if it's a rate limit error (429)
+		errStr := err.Error()
+		isRateLimited := strings.Contains(errStr, "429") || strings.Contains(errStr, "Too Many Requests")
+
+		if i < maxRetries-1 {
+			// Exponential backoff: 500ms, 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s
+			retryInterval := baseRetryInterval * time.Duration(1<<uint(i))
+			if isRateLimited {
+				// For rate limiting, use longer backoff (minimum 2 seconds)
+				if retryInterval < 2*time.Second {
+					retryInterval = 2 * time.Second
+				}
+				// Cap at 30 seconds
+				if retryInterval > 30*time.Second {
+					retryInterval = 30 * time.Second
+				}
+			} else {
+				// For other errors, cap at 5 seconds
+				if retryInterval > 5*time.Second {
+					retryInterval = 5 * time.Second
+				}
+			}
+			time.Sleep(retryInterval)
 		}
 	}
 
-	s.backfillCursor = endBlock + 1
+	if err != nil {
+		return model.Block{}, nil, nil, nil, nil, nil, nil, err
+	}
 
-	return false // Not synced yet
+	// Decode and convert
+	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
+
+	modelBlock := s.convertBlock(block)
+
+	oraclePrices := s.extractOraclePrices(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		results.EndBlockEvents,
+	)
+
+	allBlockEvents := append(results.BeginBlockEvents, results.EndBlockEvents...)
+	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		allBlockEvents,
+	)
+
+	var modelTxs []model.Tx
+	var modelEvents []model.Event
+	var modelAccountTxs []model.AccountTx
+
+	beginBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		results.BeginBlockEvents,
+	)
+	endBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"end_block",
+		results.EndBlockEvents,
+	)
+
+	modelEvents = append(modelEvents, beginBlockEvents...)
+	modelEvents = append(modelEvents, endBlockEvents...)
+
+	beginBlockAccountTxs, err := s.extractAccountBlockEvents(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		results.BeginBlockEvents,
+	)
+	if err != nil {
+		log.Printf("Failed to extract begin_block account relations: %v", err)
+	} else {
+		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
+	}
+
+	endBlockAccountTxs, err := s.extractAccountBlockEvents(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"end_block",
+		results.EndBlockEvents,
+	)
+	if err != nil {
+		log.Printf("Failed to extract end_block account relations: %v", err)
+	} else {
+		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
+	}
+
+	for i, txBytes := range block.Block.Txs {
+		decodedTx, err := txDecoder(txBytes)
+		if err != nil {
+			log.Printf("Failed to decode tx at height %d index %d: %v", block.Block.Height, i, err)
+			continue
+		}
+
+		txHash := fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash())
+
+		modelTx, events, accountTxs, err := s.convertTx(
+			uint64(block.Block.Height),
+			uint16(i),
+			block.Block.Time,
+			txHash,
+			decodedTx,
+			results,
+		)
+		if err != nil {
+			log.Printf("Failed to convert tx %s: %v", txHash, err)
+			continue
+		}
+
+		modelTxs = append(modelTxs, *modelTx)
+		modelEvents = append(modelEvents, events...)
+		modelAccountTxs = append(modelAccountTxs, accountTxs...)
+	}
+
+	return modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, validatorReturns, blockRewards, nil
 }
 
 func (s *Service) ProcessBlock(height int64) error {

@@ -41,7 +41,7 @@ func main() {
 	}
 
 	// Create Service
-	svc, err := ingest.NewService(ch, pg, cfg.Node.RPC, cfg.Node.GRPC, cfg.Ingest.BlockPollInterval, cfg.Ingest.BackfillInterval, cfg.Ingest.BackfillBatchSize, cfg.Ingest.RichlistUpdateInterval, cfg.Ingest.StartHeight, cfg.Ingest.EndHeight, cfg.Ingest.FillGaps)
+	svc, err := ingest.NewService(ch, pg, cfg.Node.RPC, cfg.Node.GRPC, cfg.Ingest.BlockPollInterval, cfg.Ingest.BackfillInterval, cfg.Ingest.BackfillBatchSize, cfg.Ingest.BackfillWorkers, cfg.Ingest.RichlistUpdateInterval, cfg.Ingest.StartHeight, cfg.Ingest.EndHeight, cfg.Ingest.FillGaps)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create ingest service")
 	}
