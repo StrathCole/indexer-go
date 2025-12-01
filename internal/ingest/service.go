@@ -16,6 +16,7 @@ import (
 
 	// Cosmos SDK imports
 	"github.com/cosmos/cosmos-sdk/client"
+	sdk "github.com/cosmos/cosmos-sdk/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,7 +35,7 @@ type Service struct {
 	pg *db.Postgres
 
 	mu      sync.RWMutex
-	rpc     *rpchttp.HTTP
+	rpcVal  atomic.Value // stores *rpchttp.HTTP
 	nodeRPC string
 
 	clientCtx client.Context
@@ -45,6 +46,9 @@ type Service struct {
 
 	// gRPC connection
 	grpcConn *grpc.ClientConn
+
+	// Cached encoding config and tx decoder (expensive to create)
+	txDecoder sdk.TxDecoder
 
 	blockPollInterval time.Duration
 	backfillInterval  time.Duration
@@ -148,16 +152,16 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		}
 	}
 
-	return &Service{
+	svc := &Service{
 		ch:                ch,
 		pg:                pg,
-		rpc:               rpcClient,
 		nodeRPC:           nodeRPC,
 		clientCtx:         clientCtx,
 		grpcConn:          grpcConn,
 		dims:              NewDimensions(pg),
 		rich:              NewRichlistService(pg, clientCtx, richlistInterval),
 		tax:               NewTaxCalculator(grpcConn),
+		txDecoder:         encCfg.TxConfig.TxDecoder(),
 		blockPollInterval: blockPollInterval,
 		backfillInterval:  backfillInterval,
 		backfillBatchSize: backfillBatchSize,
@@ -166,22 +170,26 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		fillGaps:          fillGaps,
 		backfillCursor:    startHeight,
 		backfillWorkers:   workers,
-	}, nil
+	}
+	svc.rpcVal.Store(rpcClient)
+	return svc, nil
 }
 
 func (s *Service) getRPC() *rpchttp.HTTP {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.rpc
+	if v := s.rpcVal.Load(); v != nil {
+		return v.(*rpchttp.HTTP)
+	}
+	return nil
 }
 
 func (s *Service) reconnectRPC() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.rpc != nil {
+	oldRPC := s.getRPC()
+	if oldRPC != nil {
 		// Try to stop if running, ignore error
-		_ = s.rpc.Stop()
+		_ = oldRPC.Stop()
 	}
 
 	rpcClient, err := rpchttp.New(s.nodeRPC, "/websocket")
@@ -193,7 +201,7 @@ func (s *Service) reconnectRPC() error {
 		return fmt.Errorf("failed to start RPC client: %w", err)
 	}
 
-	s.rpc = rpcClient
+	s.rpcVal.Store(rpcClient)
 	s.clientCtx = s.clientCtx.WithClient(rpcClient)
 	return nil
 }
@@ -667,8 +675,8 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 		return model.Block{}, nil, nil, nil, nil, nil, nil, err
 	}
 
-	// Decode and convert
-	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
+	// Use cached tx decoder
+	txDecoder := s.txDecoder
 
 	modelBlock := s.convertBlock(block)
 
