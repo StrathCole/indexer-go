@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/db"
@@ -518,13 +519,23 @@ func (s *Service) processBlocksParallel(ctx context.Context, heights []int64) {
 	}
 	resultChan := make(chan blockResult, len(heights))
 
+	// Progress tracking
+	var processed int64
+	total := int64(len(heights))
+
 	// Start workers
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for height := range heightChan {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				result := blockResult{height: height}
 
 				// Fetch and process block
@@ -542,8 +553,14 @@ func (s *Service) processBlocksParallel(ctx context.Context, heights []int64) {
 				}
 
 				resultChan <- result
+
+				// Log progress every 10 blocks
+				count := atomic.AddInt64(&processed, 1)
+				if count%10 == 0 || count == total {
+					log.Printf("Backfill: Progress %d/%d blocks fetched", count, total)
+				}
 			}
-		}()
+		}(i)
 	}
 
 	// Wait for all workers to finish
