@@ -3,13 +3,12 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"sync"
 
 	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
 	markettypes "github.com/classic-terra/core/v3/x/market/types"
-
-	// taxtypes "github.com/classic-terra/core/v3/x/tax/types"
 	treasurytypes "github.com/classic-terra/core/v3/x/treasury/types"
 	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -34,138 +33,236 @@ type TaxPolicy struct {
 	PolicyCap     sdk.Int
 }
 
-type CachedPolicy struct {
-	Rate sdk.Dec
-	Caps map[string]sdk.Int
-}
-
-type BlockPolicy struct {
-	ExemptionList []string
-	PolicyCap     sdk.Int
-	Height        int64 // Height at which this was fetched
+// CachedTaxPolicy includes validity range
+type CachedTaxPolicy struct {
+	Policy    *TaxPolicy
+	FromBlock int64 // First block this policy is valid for
+	ToBlock   int64 // Last block this policy is valid for (0 = unknown/ongoing)
 }
 
 type TaxCalculator struct {
 	grpcConn *grpc.ClientConn
-	cache    map[int64]*CachedPolicy
-	mu       sync.RWMutex
 
-	blockCache  *BlockPolicy
-	blockMu     sync.RWMutex
+	// Cache of policies with their validity ranges
+	// Key is the starting block of the policy
+	policyCache map[int64]*CachedTaxPolicy
+	mu          sync.RWMutex
+
+	// Track the highest block we've verified policy for
+	verifiedUpTo int64
 }
 
 func NewTaxCalculator(conn *grpc.ClientConn) *TaxCalculator {
 	return &TaxCalculator{
-		grpcConn: conn,
-		cache:    make(map[int64]*CachedPolicy),
+		grpcConn:    conn,
+		policyCache: make(map[int64]*CachedTaxPolicy),
 	}
 }
 
-func (tc *TaxCalculator) GetTaxPolicy(ctx context.Context, height int64) (*TaxPolicy, error) {
+// fetchPolicyAtHeight fetches the tax policy at a specific height via gRPC
+func (tc *TaxCalculator) fetchPolicyAtHeight(ctx context.Context, height int64) (*TaxPolicy, error) {
 	if tc.grpcConn == nil {
 		return nil, fmt.Errorf("grpc connection is nil")
 	}
 
-	// Prepare context with height
 	md := metadata.Pairs(grpctypes.GRPCBlockHeightHeader, strconv.FormatInt(height, 10))
 	ctx = metadata.NewOutgoingContext(ctx, md)
 
 	treasuryClient := treasurytypes.NewQueryClient(tc.grpcConn)
 
-	// Cache Block Policy (ExemptionList, PolicyCap) per epoch - these don't change often
-	// Use epoch-based caching (same as rate/caps) to avoid per-block gRPC calls
-	epoch := height / BlocksPerWeek
-	
-	tc.blockMu.RLock()
-	blockPolicy := tc.blockCache
-	needBlockFetch := blockPolicy == nil || (blockPolicy.Height/BlocksPerWeek) != epoch
-	tc.blockMu.RUnlock()
-
-	if needBlockFetch {
-		tc.blockMu.Lock()
-		// Double-check after acquiring write lock
-		if tc.blockCache == nil || (tc.blockCache.Height/BlocksPerWeek) != epoch {
-			// Fetch Params (Policy Cap)
-			paramsRes, err := treasuryClient.Params(ctx, &treasurytypes.QueryParamsRequest{})
+	// Fetch Tax Rate
+	var rate sdk.Dec
+	r, err := tc.fetchTaxRateGRPC(ctx, "/terra.treasury.v1beta1.Query/TaxRate")
+	if err == nil {
+		rate = r
+	} else {
+		if height >= BurnTaxReworkHeight {
+			r, err := tc.fetchTaxRateGRPC(ctx, "/terra.tax.v1beta1.Query/BurnTaxRate")
 			if err != nil {
-				tc.blockMu.Unlock()
-				return nil, fmt.Errorf("failed to fetch treasury params: %w", err)
+				return nil, fmt.Errorf("failed to fetch burn tax rate: %w", err)
 			}
-			policyCap := paramsRes.Params.TaxPolicy.Cap.Amount
-
-			// Fetch Exemption List
-			var exemptionList []string
-			exemptionRes, err := treasuryClient.BurnTaxExemptionList(ctx, &treasurytypes.QueryBurnTaxExemptionListRequest{})
-			if err == nil {
-				exemptionList = exemptionRes.Addresses
-			}
-
-			tc.blockCache = &BlockPolicy{
-				ExemptionList: exemptionList,
-				PolicyCap:     policyCap,
-				Height:        height,
-			}
+			rate = r
+		} else {
+			return nil, fmt.Errorf("failed to fetch tax rate: %w", err)
 		}
-		blockPolicy = tc.blockCache
-		tc.blockMu.Unlock()
 	}
 
-	// Cache Rate and Caps by epoch (week) - epoch already calculated above
-	tc.mu.RLock()
-	cached, ok := tc.cache[epoch]
-	tc.mu.RUnlock()
+	// Fetch Tax Caps
+	capsRes, err := treasuryClient.TaxCaps(ctx, &treasurytypes.QueryTaxCapsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch tax caps: %w", err)
+	}
+	caps := make(map[string]sdk.Int)
+	for _, c := range capsRes.TaxCaps {
+		caps[c.Denom] = c.TaxCap
+	}
 
-	if !ok {
-		tc.mu.Lock()
-		// Double check
-		if cached, ok = tc.cache[epoch]; !ok {
-			// Fetch Tax Rate
-			var rate sdk.Dec
+	// Fetch Params (Policy Cap)
+	paramsRes, err := treasuryClient.Params(ctx, &treasurytypes.QueryParamsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch treasury params: %w", err)
+	}
+	policyCap := paramsRes.Params.TaxPolicy.Cap.Amount
 
-			// Use raw gRPC to avoid proto unmarshalling issues with custom types
-			r, err := tc.fetchTaxRateGRPC(ctx, "/terra.treasury.v1beta1.Query/TaxRate")
-			if err == nil {
-				rate = r
-			} else {
-				if height >= BurnTaxReworkHeight {
-					r, err := tc.fetchTaxRateGRPC(ctx, "/terra.tax.v1beta1.Query/BurnTaxRate")
-					if err != nil {
-						tc.mu.Unlock()
-						return nil, fmt.Errorf("failed to fetch burn tax rate: %w", err)
-					}
-					rate = r
-				} else {
-					tc.mu.Unlock()
-					return nil, fmt.Errorf("failed to fetch tax rate: %w", err)
-				}
-			}
-
-			// Fetch Tax Caps
-			capsRes, err := treasuryClient.TaxCaps(ctx, &treasurytypes.QueryTaxCapsRequest{})
-			if err != nil {
-				tc.mu.Unlock()
-				return nil, fmt.Errorf("failed to fetch tax caps: %w", err)
-			}
-			caps := make(map[string]sdk.Int)
-			for _, c := range capsRes.TaxCaps {
-				caps[c.Denom] = c.TaxCap
-			}
-
-			cached = &CachedPolicy{
-				Rate: rate,
-				Caps: caps,
-			}
-			tc.cache[epoch] = cached
-		}
-		tc.mu.Unlock()
+	// Fetch Exemption List
+	var exemptionList []string
+	exemptionRes, err := treasuryClient.BurnTaxExemptionList(ctx, &treasurytypes.QueryBurnTaxExemptionListRequest{})
+	if err == nil {
+		exemptionList = exemptionRes.Addresses
 	}
 
 	return &TaxPolicy{
-		Rate:          cached.Rate,
-		Caps:          cached.Caps,
-		ExemptionList: blockPolicy.ExemptionList,
-		PolicyCap:     blockPolicy.PolicyCap,
+		Rate:          rate,
+		Caps:          caps,
+		ExemptionList: exemptionList,
+		PolicyCap:     policyCap,
 	}, nil
+}
+
+// policiesEqual compares two tax policies for equality
+func (tc *TaxCalculator) policiesEqual(a, b *TaxPolicy) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	// Compare rate
+	if !a.Rate.Equal(b.Rate) {
+		return false
+	}
+
+	// Compare policy cap
+	if !a.PolicyCap.Equal(b.PolicyCap) {
+		return false
+	}
+
+	// Compare caps
+	if len(a.Caps) != len(b.Caps) {
+		return false
+	}
+	for denom, capA := range a.Caps {
+		capB, ok := b.Caps[denom]
+		if !ok || !capA.Equal(capB) {
+			return false
+		}
+	}
+
+	// Compare exemption list
+	if len(a.ExemptionList) != len(b.ExemptionList) {
+		return false
+	}
+	exemptionMapA := make(map[string]bool)
+	for _, addr := range a.ExemptionList {
+		exemptionMapA[addr] = true
+	}
+	for _, addr := range b.ExemptionList {
+		if !exemptionMapA[addr] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// findPolicyChangeBlock uses binary search to find the exact block where policy changed
+func (tc *TaxCalculator) findPolicyChangeBlock(ctx context.Context, startBlock, endBlock int64, startPolicy *TaxPolicy) (int64, error) {
+	// Binary search between startBlock and endBlock
+	low := startBlock
+	high := endBlock
+
+	for low < high {
+		mid := (low + high) / 2
+
+		midPolicy, err := tc.fetchPolicyAtHeight(ctx, mid)
+		if err != nil {
+			return 0, err
+		}
+
+		if tc.policiesEqual(startPolicy, midPolicy) {
+			// Policy is still the same at mid, change is after mid
+			low = mid + 1
+		} else {
+			// Policy changed at or before mid
+			high = mid
+		}
+	}
+
+	return low, nil
+}
+
+// GetTaxPolicy returns the tax policy for a given height, using cached ranges
+func (tc *TaxCalculator) GetTaxPolicy(ctx context.Context, height int64) (*TaxPolicy, error) {
+	tc.mu.RLock()
+	// Find cached policy that covers this height
+	for startBlock, cached := range tc.policyCache {
+		if height >= startBlock && (cached.ToBlock == 0 || height <= cached.ToBlock) {
+			tc.mu.RUnlock()
+			return cached.Policy, nil
+		}
+	}
+	tc.mu.RUnlock()
+
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	for startBlock, cached := range tc.policyCache {
+		if height >= startBlock && (cached.ToBlock == 0 || height <= cached.ToBlock) {
+			return cached.Policy, nil
+		}
+	}
+
+	// Fetch policy at this height
+	policy, err := tc.fetchPolicyAtHeight(ctx, height)
+	if err != nil {
+		return nil, err
+	}
+
+	// Look ahead to see if policy changes soon
+	// Check one epoch ahead
+	lookAheadBlock := height + BlocksPerWeek
+	lookAheadPolicy, err := tc.fetchPolicyAtHeight(ctx, lookAheadBlock)
+
+	var toBlock int64 = 0 // Unknown end
+
+	if err == nil {
+		if tc.policiesEqual(policy, lookAheadPolicy) {
+			// Policy is the same for at least one epoch ahead
+			// We can safely cache for this range
+			toBlock = 0 // Will be updated when we find a change
+		} else {
+			// Policy changed within this epoch - find exact change point
+			changeBlock, err := tc.findPolicyChangeBlock(ctx, height, lookAheadBlock, policy)
+			if err != nil {
+				log.Printf("Tax: Failed to find policy change block: %v", err)
+				// Still cache current policy but with conservative range
+				toBlock = height + BlocksPerWeek/10 // Cache for ~1/10 of an epoch
+			} else {
+				toBlock = changeBlock - 1
+				log.Printf("Tax: Policy changes at block %d", changeBlock)
+			}
+		}
+	}
+
+	// Store in cache
+	tc.policyCache[height] = &CachedTaxPolicy{
+		Policy:    policy,
+		FromBlock: height,
+		ToBlock:   toBlock,
+	}
+
+	// If we determined a valid end block, also prefetch and cache the next policy
+	if toBlock > 0 && err == nil {
+		nextPolicy, err := tc.fetchPolicyAtHeight(ctx, toBlock+1)
+		if err == nil {
+			tc.policyCache[toBlock+1] = &CachedTaxPolicy{
+				Policy:    nextPolicy,
+				FromBlock: toBlock + 1,
+				ToBlock:   0,
+			}
+		}
+	}
+
+	return policy, nil
 }
 
 func (tc *TaxCalculator) CalculateTax(ctx context.Context, height int64, tx sdk.Tx, cdc codec.Codec) (sdk.Coins, error) {
@@ -284,19 +381,15 @@ func (tc *TaxCalculator) fetchTaxRateGRPC(ctx context.Context, method string) (s
 	if err != nil {
 		return sdk.Dec{}, err
 	}
-	// log.Printf("Raw Tax Rate: %s", out.TaxRate)
+
 	dec, err := sdk.NewDecFromStr(out.TaxRate)
 	if err != nil {
 		return sdk.Dec{}, err
 	}
 
 	// Heuristic: If tax rate is > 1, it's likely an unscaled integer (10^18)
-	// Tax rate should be small (e.g. 0.005).
 	if dec.GT(sdk.OneDec()) {
-		// Divide by 10^18
-		precision := sdk.NewDecFromIntWithPrec(sdk.OneInt(), 18) // 10^-18
-		// Wait, NewDecFromIntWithPrec(1, 18) is 0.000...01
-		// We want to multiply by 10^-18
+		precision := sdk.NewDecFromIntWithPrec(sdk.OneInt(), 18)
 		dec = dec.Mul(precision)
 	}
 
