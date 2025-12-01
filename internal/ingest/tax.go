@@ -42,6 +42,7 @@ type CachedPolicy struct {
 type BlockPolicy struct {
 	ExemptionList []string
 	PolicyCap     sdk.Int
+	Height        int64 // Height at which this was fetched
 }
 
 type TaxCalculator struct {
@@ -50,8 +51,7 @@ type TaxCalculator struct {
 	mu       sync.RWMutex
 
 	blockCache  *BlockPolicy
-	blockHeight int64
-	blockMu     sync.Mutex
+	blockMu     sync.RWMutex
 }
 
 func NewTaxCalculator(conn *grpc.ClientConn) *TaxCalculator {
@@ -72,35 +72,45 @@ func (tc *TaxCalculator) GetTaxPolicy(ctx context.Context, height int64) (*TaxPo
 
 	treasuryClient := treasurytypes.NewQueryClient(tc.grpcConn)
 
-	// Fetch Block Policy (ExemptionList, PolicyCap)
-	tc.blockMu.Lock()
-	if tc.blockCache == nil || tc.blockHeight != height {
-		// Fetch Params (Policy Cap) - Always fetch fresh as per fcd-classic
-		paramsRes, err := treasuryClient.Params(ctx, &treasurytypes.QueryParamsRequest{})
-		if err != nil {
-			tc.blockMu.Unlock()
-			return nil, fmt.Errorf("failed to fetch treasury params: %w", err)
-		}
-		policyCap := paramsRes.Params.TaxPolicy.Cap.Amount
-
-		// Fetch Exemption List - Always fetch fresh as per fcd-classic
-		var exemptionList []string
-		exemptionRes, err := treasuryClient.BurnTaxExemptionList(ctx, &treasurytypes.QueryBurnTaxExemptionListRequest{})
-		if err == nil {
-			exemptionList = exemptionRes.Addresses
-		}
-
-		tc.blockCache = &BlockPolicy{
-			ExemptionList: exemptionList,
-			PolicyCap:     policyCap,
-		}
-		tc.blockHeight = height
-	}
-	blockPolicy := tc.blockCache
-	tc.blockMu.Unlock()
-
-	// Cache Rate and Caps by epoch (week)
+	// Cache Block Policy (ExemptionList, PolicyCap) per epoch - these don't change often
+	// Use epoch-based caching (same as rate/caps) to avoid per-block gRPC calls
 	epoch := height / BlocksPerWeek
+	
+	tc.blockMu.RLock()
+	blockPolicy := tc.blockCache
+	needBlockFetch := blockPolicy == nil || (blockPolicy.Height/BlocksPerWeek) != epoch
+	tc.blockMu.RUnlock()
+
+	if needBlockFetch {
+		tc.blockMu.Lock()
+		// Double-check after acquiring write lock
+		if tc.blockCache == nil || (tc.blockCache.Height/BlocksPerWeek) != epoch {
+			// Fetch Params (Policy Cap)
+			paramsRes, err := treasuryClient.Params(ctx, &treasurytypes.QueryParamsRequest{})
+			if err != nil {
+				tc.blockMu.Unlock()
+				return nil, fmt.Errorf("failed to fetch treasury params: %w", err)
+			}
+			policyCap := paramsRes.Params.TaxPolicy.Cap.Amount
+
+			// Fetch Exemption List
+			var exemptionList []string
+			exemptionRes, err := treasuryClient.BurnTaxExemptionList(ctx, &treasurytypes.QueryBurnTaxExemptionListRequest{})
+			if err == nil {
+				exemptionList = exemptionRes.Addresses
+			}
+
+			tc.blockCache = &BlockPolicy{
+				ExemptionList: exemptionList,
+				PolicyCap:     policyCap,
+				Height:        height,
+			}
+		}
+		blockPolicy = tc.blockCache
+		tc.blockMu.Unlock()
+	}
+
+	// Cache Rate and Caps by epoch (week) - epoch already calculated above
 	tc.mu.RLock()
 	cached, ok := tc.cache[epoch]
 	tc.mu.RUnlock()

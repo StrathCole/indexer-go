@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/classic-terra/core/v3/app"
 	"github.com/classic-terra/indexer-go/internal/model"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
@@ -85,7 +84,8 @@ func (s *Service) convertTx(
 	// txHash is already Hex string. Use it directly for ClickHouse FixedString(64)
 	txHashRaw := txHash
 
-	cdc := app.MakeEncodingConfig().Marshaler
+	// Use cached codec from service
+	cdc := s.cdc
 
 	// Extract fees
 	feeTx, ok := tx.(sdk.FeeTx)

@@ -16,6 +16,7 @@ import (
 
 	// Cosmos SDK imports
 	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -49,6 +50,7 @@ type Service struct {
 
 	// Cached encoding config and tx decoder (expensive to create)
 	txDecoder sdk.TxDecoder
+	cdc       codec.Codec
 
 	blockPollInterval time.Duration
 	backfillInterval  time.Duration
@@ -162,6 +164,7 @@ func NewService(ch *db.ClickHouse, pg *db.Postgres, nodeRPC string, nodeGRPC str
 		rich:              NewRichlistService(pg, clientCtx, richlistInterval),
 		tax:               NewTaxCalculator(grpcConn),
 		txDecoder:         encCfg.TxConfig.TxDecoder(),
+		cdc:               encCfg.Marshaler,
 		blockPollInterval: blockPollInterval,
 		backfillInterval:  backfillInterval,
 		backfillBatchSize: backfillBatchSize,
@@ -631,9 +634,9 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 		return model.Block{}, nil, nil, nil, nil, nil, nil, fmt.Errorf("RPC client not available")
 	}
 
-	// Retry fetching block and results with exponential backoff for rate limiting
-	maxRetries := 10
-	baseRetryInterval := 500 * time.Millisecond
+	// Retry fetching block and results with exponential backoff
+	maxRetries := 5
+	baseRetryInterval := 200 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
 		block, err = rpc.Block(context.Background(), &height)
@@ -645,27 +648,10 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 			break
 		}
 
-		// Check if it's a rate limit error (429)
-		errStr := err.Error()
-		isRateLimited := strings.Contains(errStr, "429") || strings.Contains(errStr, "Too Many Requests")
-
 		if i < maxRetries-1 {
-			// Exponential backoff: 500ms, 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s
 			retryInterval := baseRetryInterval * time.Duration(1<<uint(i))
-			if isRateLimited {
-				// For rate limiting, use longer backoff (minimum 2 seconds)
-				if retryInterval < 2*time.Second {
-					retryInterval = 2 * time.Second
-				}
-				// Cap at 30 seconds
-				if retryInterval > 30*time.Second {
-					retryInterval = 30 * time.Second
-				}
-			} else {
-				// For other errors, cap at 5 seconds
-				if retryInterval > 5*time.Second {
-					retryInterval = 5 * time.Second
-				}
+			if retryInterval > 2*time.Second {
+				retryInterval = 2 * time.Second
 			}
 			time.Sleep(retryInterval)
 		}
