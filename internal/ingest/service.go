@@ -794,8 +794,8 @@ func (s *Service) ProcessBlock(height int64) error {
 }
 
 func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.ResultBlockResults) error {
-	// Decode transactions
-	txDecoder := app.MakeEncodingConfig().TxConfig.TxDecoder()
+	// Use cached tx decoder to avoid creating new encoding config every time
+	txDecoder := s.txDecoder
 
 	// Convert Block
 	modelBlock := s.convertBlock(block)

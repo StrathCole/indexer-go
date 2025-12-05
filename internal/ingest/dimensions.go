@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/classic-terra/indexer-go/internal/db"
 )
@@ -15,11 +16,27 @@ type Dimensions struct {
 	addressCache sync.Map // map[string]uint64
 	denomCache   sync.Map // map[string]uint16
 	msgTypeCache sync.Map // map[string]uint16
+
+	// Track address cache size for periodic cleanup
+	addressCacheSize int64
+	maxAddressCache  int64
 }
 
 func NewDimensions(pg *db.Postgres) *Dimensions {
 	return &Dimensions{
-		pg: pg,
+		pg:              pg,
+		maxAddressCache: 500000, // Cap at 500k addresses (~40MB for strings + IDs)
+	}
+}
+
+// clearAddressCache clears the address cache when it grows too large
+// This is a simple approach - a proper LRU would be better but adds complexity
+func (d *Dimensions) clearAddressCacheIfNeeded() {
+	size := atomic.LoadInt64(&d.addressCacheSize)
+	if size > d.maxAddressCache {
+		// Clear the entire cache - entries will be re-fetched from DB as needed
+		d.addressCache = sync.Map{}
+		atomic.StoreInt64(&d.addressCacheSize, 0)
 	}
 }
 
@@ -28,11 +45,15 @@ func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string) (
 		return id.(uint64), nil
 	}
 
+	// Check if cache needs cleanup before adding new entries
+	d.clearAddressCacheIfNeeded()
+
 	// Try to select first
 	var id uint64
 	err := d.pg.Pool.QueryRow(ctx, "SELECT id FROM addresses WHERE address = $1", address).Scan(&id)
 	if err == nil {
 		d.addressCache.Store(address, id)
+		atomic.AddInt64(&d.addressCacheSize, 1)
 		return id, nil
 	}
 
@@ -68,6 +89,7 @@ func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string) (
 	}
 
 	d.addressCache.Store(address, id)
+	atomic.AddInt64(&d.addressCacheSize, 1)
 	return id, nil
 }
 

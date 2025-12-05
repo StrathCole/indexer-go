@@ -50,12 +50,16 @@ type TaxCalculator struct {
 
 	// Track the highest block we've verified policy for
 	verifiedUpTo int64
+
+	// Maximum cache size to prevent unbounded growth
+	maxCacheSize int
 }
 
 func NewTaxCalculator(conn *grpc.ClientConn) *TaxCalculator {
 	return &TaxCalculator{
-		grpcConn:    conn,
-		policyCache: make(map[int64]*CachedTaxPolicy),
+		grpcConn:     conn,
+		policyCache:  make(map[int64]*CachedTaxPolicy),
+		maxCacheSize: 100, // Keep at most 100 policy entries
 	}
 }
 
@@ -243,6 +247,11 @@ func (tc *TaxCalculator) GetTaxPolicy(ctx context.Context, height int64) (*TaxPo
 		}
 	}
 
+	// Prune cache if it exceeds max size (keep most recent entries)
+	if len(tc.policyCache) >= tc.maxCacheSize {
+		tc.pruneCache()
+	}
+
 	// Store in cache
 	tc.policyCache[height] = &CachedTaxPolicy{
 		Policy:    policy,
@@ -263,6 +272,34 @@ func (tc *TaxCalculator) GetTaxPolicy(ctx context.Context, height int64) (*TaxPo
 	}
 
 	return policy, nil
+}
+
+// pruneCache removes the oldest entries to keep cache size bounded
+// Must be called with write lock held
+func (tc *TaxCalculator) pruneCache() {
+	if len(tc.policyCache) < tc.maxCacheSize/2 {
+		return
+	}
+
+	// Find entries with defined ToBlock (completed ranges) - these are safe to remove
+	// Keep entries where ToBlock == 0 (ongoing/unknown end) as they might still be needed
+	var keysToRemove []int64
+	for k, v := range tc.policyCache {
+		if v.ToBlock > 0 {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	// Remove half of the completed entries (oldest first by FromBlock)
+	removeCount := len(keysToRemove) / 2
+	if removeCount == 0 && len(keysToRemove) > 0 {
+		removeCount = 1
+	}
+
+	// Simple removal of first entries (not perfectly sorted, but good enough)
+	for i := 0; i < removeCount && i < len(keysToRemove); i++ {
+		delete(tc.policyCache, keysToRemove[i])
+	}
 }
 
 func (tc *TaxCalculator) CalculateTax(ctx context.Context, height int64, tx sdk.Tx, cdc codec.Codec) (sdk.Coins, error) {

@@ -48,21 +48,9 @@ func (s *RichlistService) UpdateRichlist(ctx context.Context) {
 
 	log.Println("Updating richlist...")
 
-	// 1. Fetch all addresses from Postgres
-	rows, err := s.pg.Pool.Query(ctx, "SELECT address FROM addresses")
-	if err != nil {
-		log.Printf("Failed to fetch addresses: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	var addresses []string
-	for rows.Next() {
-		var addr string
-		if err := rows.Scan(&addr); err == nil {
-			addresses = append(addresses, addr)
-		}
-	}
+	// Use cursor-based pagination to avoid loading all addresses into memory
+	const batchSize = 1000
+	var lastID int64 = 0
 
 	// 2. Fetch balances and aggregate
 	type AccBal struct {
@@ -73,20 +61,57 @@ func (s *RichlistService) UpdateRichlist(ctx context.Context) {
 
 	bankClient := banktypes.NewQueryClient(s.clientCtx)
 
-	for _, addr := range addresses {
-		// Rate limit?
-		time.Sleep(10 * time.Millisecond)
-
-		resp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{Address: addr})
+	for {
+		// Fetch addresses in batches using cursor pagination
+		rows, err := s.pg.Pool.Query(ctx, 
+			"SELECT id, address FROM addresses WHERE id > $1 ORDER BY id LIMIT $2", 
+			lastID, batchSize)
 		if err != nil {
-			continue
+			log.Printf("Failed to fetch addresses: %v", err)
+			return
 		}
 
-		for _, coin := range resp.Balances {
-			richList[coin.Denom] = append(richList[coin.Denom], AccBal{
-				Address: addr,
-				Amount:  coin.Amount.String(),
-			})
+		var addresses []string
+		var maxID int64
+		for rows.Next() {
+			var id int64
+			var addr string
+			if err := rows.Scan(&id, &addr); err == nil {
+				addresses = append(addresses, addr)
+				if id > maxID {
+					maxID = id
+				}
+			}
+		}
+		rows.Close()
+
+		if len(addresses) == 0 {
+			break // No more addresses
+		}
+
+		lastID = maxID
+
+		// Process this batch of addresses
+		for _, addr := range addresses {
+			// Rate limit
+			time.Sleep(10 * time.Millisecond)
+
+			resp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{Address: addr})
+			if err != nil {
+				continue
+			}
+
+			for _, coin := range resp.Balances {
+				richList[coin.Denom] = append(richList[coin.Denom], AccBal{
+					Address: addr,
+					Amount:  coin.Amount.String(),
+				})
+			}
+		}
+
+		// If we got fewer than batchSize, we're done
+		if len(addresses) < batchSize {
+			break
 		}
 	}
 
