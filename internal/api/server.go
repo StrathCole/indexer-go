@@ -26,11 +26,9 @@ type Server struct {
 	cache            *Cache
 	corsOrigins      []string
 	excludedAccounts []string
-	lcdURL           string
-	swaggerCache     swaggerDocCache
 }
 
-func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpcClient *rpchttp.HTTP, corsOrigins []string, excludedAccounts []string, lcdURL string) *Server {
+func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpcClient *rpchttp.HTTP, corsOrigins []string, excludedAccounts []string) *Server {
 	return &Server{
 		ch:               ch,
 		pg:               pg,
@@ -39,7 +37,6 @@ func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpc
 		cache:            NewCache(),
 		corsOrigins:      corsOrigins,
 		excludedAccounts: excludedAccounts,
-		lcdURL:           lcdURL,
 	}
 }
 
