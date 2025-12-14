@@ -5,8 +5,8 @@ import (
 	"net/http"
 )
 
-//go:embed openapi.json
-var openAPISpecJSON []byte
+//go:embed swagger_idx.json
+var swaggerFCDSpecJSON []byte
 
 const swaggerUIHTML = `<!doctype html>
 <html lang="en">
@@ -43,8 +43,14 @@ func (s *Server) SwaggerUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) SwaggerDoc(w http.ResponseWriter, r *http.Request) {
+	doc, err := s.getSwaggerDoc(r.Context())
+	if err != nil {
+		http.Error(w, "Failed to build swagger document", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(openAPISpecJSON)
+	_, _ = w.Write(doc)
 }
