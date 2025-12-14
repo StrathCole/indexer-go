@@ -8,6 +8,11 @@ It uses ClickHouse for storing historical data (blocks, txs, events) and Postgre
 - **indexer-ingest**: Connects to a Terra Classic node (RPC/gRPC), fetches blocks, processes them, and inserts data into ClickHouse.
 - **indexer-api**: Serves REST APIs compatible with FCD, querying ClickHouse for history and the Node RPC for live state.
 
+## Swagger
+
+The API serves Swagger UI at `/swagger/` and the raw Swagger 2.0 spec at `/swagger/doc.json`.
+If `node.lcd` is configured, the spec is merged with the node's LCD swagger (`/swagger/swagger.yaml`) for a more comprehensive doc set.
+
 ## Prerequisites
 
 - Go 1.24+
@@ -106,6 +111,83 @@ For fast block-by-height endpoints (which query block-level events by height), i
 ```sql
 ALTER TABLE events ADD INDEX IF NOT EXISTS idx_events_height height TYPE minmax GRANULARITY 1;
 ALTER TABLE events MATERIALIZE INDEX idx_events_height;
+```
+
+If your `events` table is still ordered by `(event_type, attr_key, height, ...)`, block-by-height queries can still be slow even with `idx_events_height`. The most effective fix is to rebuild `events` with a height-first primary key.
+
+Migration options:
+
+1) Small/medium tables: one-time migration (safe rename swap)
+
+```sql
+-- 1) Create a new events table with height-first ORDER BY
+DROP TABLE IF EXISTS events_v2;
+CREATE TABLE events_v2 (
+	height          UInt64,
+	INDEX idx_events_height height TYPE minmax GRANULARITY 1,
+	block_time      DateTime64(3),
+	scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
+	tx_index        Int16,
+	event_index     UInt16,
+	event_type      LowCardinality(String),
+	INDEX idx_events_event_type event_type TYPE bloom_filter(0.01) GRANULARITY 4,
+	attr_key        LowCardinality(String),
+	INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
+	INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
+	attr_value      String,
+	tx_hash         FixedString(64) DEFAULT ''
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(block_time)
+ORDER BY (height, scope, tx_index, event_index, event_type, attr_key);
+
+-- 2) Backfill
+INSERT INTO events_v2 SELECT * FROM events;
+
+-- 3) Atomic swap
+RENAME TABLE events TO events_old, events_v2 TO events;
+
+-- 4) (Optional) Drop the old table after verification
+-- DROP TABLE events_old;
+```
+
+2) Very large tables (disk constrained): partition-by-partition copy + drop
+
+This avoids needing enough disk to hold a full second copy of `events`. You only need headroom for one partition at a time.
+
+```sql
+-- Create the destination table once (same DDL as above)
+DROP TABLE IF EXISTS events_v2;
+CREATE TABLE events_v2 (
+	height          UInt64,
+	INDEX idx_events_height height TYPE minmax GRANULARITY 1,
+	block_time      DateTime64(3),
+	scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
+	tx_index        Int16,
+	event_index     UInt16,
+	event_type      LowCardinality(String),
+	INDEX idx_events_event_type event_type TYPE bloom_filter(0.01) GRANULARITY 4,
+	attr_key        LowCardinality(String),
+	INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
+	INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
+	attr_value      String,
+	tx_hash         FixedString(64) DEFAULT ''
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(block_time)
+ORDER BY (height, scope, tx_index, event_index, event_type, attr_key);
+
+-- Get partitions present
+SELECT DISTINCT toYYYYMM(block_time) AS p FROM events ORDER BY p ASC;
+
+-- For each partition p, copy it and then drop it from the old table (repeat per p)
+INSERT INTO events_v2
+SELECT * FROM events
+WHERE toYYYYMM(block_time) = 202401;
+
+ALTER TABLE events DROP PARTITION 202401;
+
+-- After all partitions are migrated:
+RENAME TABLE events TO events_old, events_v2 TO events;
+-- DROP TABLE events_old;
 ```
 
 ### Verification

@@ -26,9 +26,11 @@ type Server struct {
 	cache            *Cache
 	corsOrigins      []string
 	excludedAccounts []string
+	lcdURL           string
+	swaggerCache     swaggerDocCache
 }
 
-func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpcClient *rpchttp.HTTP, corsOrigins []string, excludedAccounts []string) *Server {
+func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpcClient *rpchttp.HTTP, corsOrigins []string, excludedAccounts []string, lcdURL string) *Server {
 	return &Server{
 		ch:               ch,
 		pg:               pg,
@@ -37,6 +39,7 @@ func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpc
 		cache:            NewCache(),
 		corsOrigins:      corsOrigins,
 		excludedAccounts: excludedAccounts,
+		lcdURL:           lcdURL,
 	}
 }
 
@@ -50,6 +53,11 @@ func (s *Server) Router() http.Handler {
 
 	// Routes
 	v1 := r.PathPrefix("/v1").Subrouter()
+
+	// Swagger
+	r.HandleFunc("/swagger", s.SwaggerRedirect).Methods("GET")
+	r.HandleFunc("/swagger/", s.SwaggerUI).Methods("GET")
+	r.HandleFunc("/swagger/doc.json", s.SwaggerDoc).Methods("GET")
 
 	// Dashboard
 	v1.HandleFunc("/dashboard", s.GetDashboard).Methods("GET")

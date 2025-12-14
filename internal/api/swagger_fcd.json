@@ -1,0 +1,201 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Terra Classic Indexer API (FCD compatible)",
+    "version": "1.0.0",
+    "description": "FCD-compatible endpoints served by indexer-api. This is intended to be merged with an LCD swagger spec for a comprehensive API doc set."
+  },
+  "schemes": ["https", "http"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["Root"],
+        "summary": "Service status",
+        "responses": {
+          "200": { "description": "OK" }
+        }
+      }
+    },
+
+    "/v1/dashboard": { "get": { "tags": ["Dashboard"], "summary": "Dashboard overview", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/tx_volume": { "get": { "tags": ["Dashboard"], "summary": "Transaction volume", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/block_rewards": { "get": { "tags": ["Dashboard"], "summary": "Block rewards", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/seigniorage_proceeds": { "get": { "tags": ["Dashboard"], "summary": "Seigniorage proceeds", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/staking_return": { "get": { "tags": ["Dashboard"], "summary": "Staking return", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/staking_ratio": { "get": { "tags": ["Dashboard"], "summary": "Staking ratio", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/account_growth": { "get": { "tags": ["Dashboard"], "summary": "Account growth", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/active_accounts": { "get": { "tags": ["Dashboard"], "summary": "Active accounts", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/registered_accounts": { "get": { "tags": ["Dashboard"], "summary": "Registered accounts", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/last_hour_ops_txs_count": { "get": { "tags": ["Dashboard"], "summary": "Last-hour ops + txs count", "responses": { "200": { "description": "OK" } } } },
+
+    "/v1/txs/gas_prices": { "get": { "tags": ["Transactions"], "summary": "Gas prices", "responses": { "200": { "description": "OK" } } } },
+    "/v1/txs": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "List transactions",
+        "parameters": [
+          { "name": "account", "in": "query", "required": false, "type": "string" },
+          { "name": "limit", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "offset", "in": "query", "required": false, "type": "integer", "format": "int32" }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/v1/txs/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get transaction by hash",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tx/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get transaction by hash (alias)",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/mempool": { "get": { "tags": ["Transactions"], "summary": "Mempool transactions", "responses": { "200": { "description": "OK" } } } },
+    "/v1/mempool/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get mempool transaction by hash",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/blocks/latest": { "get": { "tags": ["Blocks"], "summary": "Latest block", "responses": { "200": { "description": "OK" } } } },
+    "/v1/blocks/{height}": {
+      "get": {
+        "tags": ["Blocks"],
+        "summary": "Get block by height",
+        "parameters": [
+          { "name": "height", "in": "path", "required": true, "type": "integer", "format": "int64" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/blocks/{height}/events": {
+      "get": {
+        "tags": ["Blocks"],
+        "summary": "Get block events by height",
+        "parameters": [
+          { "name": "height", "in": "path", "required": true, "type": "integer", "format": "int64" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/bank/{account}": {
+      "get": {
+        "tags": ["Bank"],
+        "summary": "Balances for account",
+        "parameters": [
+          { "name": "account", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/market/price": { "get": { "tags": ["Market"], "summary": "Market price", "responses": { "200": { "description": "OK" } } } },
+    "/v1/market/swaprate/{base}": {
+      "get": {
+        "tags": ["Market"],
+        "summary": "Market swap rate",
+        "parameters": [
+          { "name": "base", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/staking/validators": { "get": { "tags": ["Staking"], "summary": "List validators", "responses": { "200": { "description": "OK" } } } },
+    "/v1/staking/validators/{operatorAddr}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Get validator",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/validators/{operatorAddr}/claims": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Validator claims",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/account/{account}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Staking account",
+        "parameters": [
+          { "name": "account", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/return": { "get": { "tags": ["Staking"], "summary": "Total staking return", "responses": { "200": { "description": "OK" } } } },
+    "/v1/staking/return/{operatorAddr}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Validator staking return",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/taxproceeds": { "get": { "tags": ["Treasury"], "summary": "Tax proceeds", "responses": { "200": { "description": "OK" } } } },
+    "/v1/richlist/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Richlist for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" },
+          { "name": "page", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "limit", "in": "query", "required": false, "type": "integer", "format": "int32" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/totalsupply/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Total supply for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/circulatingsupply/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Circulating supply for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    }
+  },
+  "definitions": {}
+}

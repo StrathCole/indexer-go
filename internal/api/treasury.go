@@ -29,7 +29,7 @@ extract(attr_value, '([a-z]+)') as denom,
 toString(sum(cast(extract(attr_value, '(\\d+)') as UInt64))) as amount,
 toString(sum(cast(extract(attr_value, '(\\d+)') as UInt64))) as adjustedAmount
 FROM events 
-WHERE event_type = 'tax' AND attr_key = 'amount'
+PREWHERE event_type = 'tax' AND attr_key = 'amount'
 GROUP BY denom
 `
 

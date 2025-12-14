@@ -73,6 +73,7 @@ func main() {
     index_in_block  UInt16,
     block_time      DateTime64(3),
     tx_hash         FixedString(64),
+	INDEX idx_tx_hash tx_hash TYPE bloom_filter(0.01) GRANULARITY 4,
     codespace       LowCardinality(String),
     code            UInt32,
     gas_wanted      UInt64,
@@ -91,15 +92,19 @@ func main() {
 
 			"events": `CREATE TABLE IF NOT EXISTS events (
     height          UInt64,
+	INDEX idx_events_height height TYPE minmax GRANULARITY 1,
     block_time      DateTime64(3),
     scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
     tx_index        Int16,
     event_index     UInt16,
     event_type      LowCardinality(String),
+	INDEX idx_events_event_type event_type TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_key        LowCardinality(String),
+	INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
+	INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_value      String,
     tx_hash         FixedString(64) DEFAULT ''
-) ENGINE = MergeTree PARTITION BY toYYYYMM(block_time) ORDER BY (event_type, attr_key, height, tx_index, event_index)`,
+) ENGINE = MergeTree PARTITION BY toYYYYMM(block_time) ORDER BY (height, scope, tx_index, event_index, event_type, attr_key)`,
 
 			"account_txs": `CREATE TABLE IF NOT EXISTS account_txs (
     address_id      UInt64,
@@ -109,8 +114,10 @@ func main() {
     tx_hash         FixedString(64),
     direction       Int8,
     main_denom_id   UInt16,
-    main_amount     Int64
-) ENGINE = MergeTree PARTITION BY toYYYYMM(block_time) ORDER BY (address_id, height, index_in_block)`,
+	main_amount     Int64,
+	is_block_event  Bool DEFAULT false,
+	event_scope     Int8 DEFAULT 0
+) ENGINE = MergeTree PARTITION BY toYYYYMM(block_time) ORDER BY (address_id, height, index_in_block, is_block_event)`,
 
 			"oracle_prices": `CREATE TABLE IF NOT EXISTS oracle_prices (
     block_time      DateTime64(3),

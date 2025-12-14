@@ -130,7 +130,7 @@ func main() {
 		WithLegacyAmino(encodingConfig.Amino)
 
 	// Create Server
-	srv := api.NewServer(ch, pg, clientCtx, rpcClient, cfg.Server.CORSAllowedOrigins, cfg.Server.ExcludedAccounts)
+	srv := api.NewServer(ch, pg, clientCtx, rpcClient, cfg.Server.CORSAllowedOrigins, cfg.Server.ExcludedAccounts, cfg.Node.LCD)
 
 	// Start Server
 	go func() {

@@ -13,6 +13,8 @@ postgres_conn = "postgres://user:password@localhost:5432/fcd"
 [node]
 rpc = "http://localhost:26657"
 grpc = "localhost:9090"
+# Optional: if provided, /swagger/doc.json will merge this LCD swagger with the FCD endpoints.
+# lcd = "https://<lcd-host>"  # expects swagger at /swagger/swagger.yaml
 
 [ingest]
 block_poll_interval = "1s"

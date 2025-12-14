@@ -45,13 +45,16 @@ CREATE TABLE IF NOT EXISTS events (
     tx_index        Int16,                 -- -1 for block-level events
     event_index     UInt16,
     event_type      LowCardinality(String),
+    INDEX idx_events_event_type event_type TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_key        LowCardinality(String),
+    INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_value      String,
     tx_hash         FixedString(64) DEFAULT ''
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
-ORDER BY (event_type, attr_key, height, tx_index, event_index);
+ORDER BY (height, scope, tx_index, event_index, event_type, attr_key);
 
 -- Account activity tracking for both transactions and block events
 CREATE TABLE IF NOT EXISTS account_txs (

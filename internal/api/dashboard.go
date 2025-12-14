@@ -306,7 +306,7 @@ func (s *Server) GetBlockRewards(w http.ResponseWriter, r *http.Request) {
 					block_time,
 					arrayJoin(splitByChar(',', attr_value)) as reward_str
 				FROM events 
-				WHERE event_type = 'rewards' AND attr_key = 'amount'
+				PREWHERE event_type = 'rewards' AND attr_key = 'amount'
 			)
 			WHERE replaceRegexpOne(reward_str, '^[\\d\\.]+', '') = 'ukrw'
 			GROUP BY datetime 
@@ -366,7 +366,7 @@ func (s *Server) GetSeigniorageProceeds(w http.ResponseWriter, r *http.Request) 
 				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
 				toString(sum(cast(extract(attr_value, '^[\\d\\.]+') as Decimal(38, 10)))) as seigniorageProceeds 
 			FROM events 
-			WHERE event_type = 'seigniorage_proceeds' AND attr_key = 'amount'
+			PREWHERE event_type = 'seigniorage_proceeds' AND attr_key = 'amount'
 			GROUP BY datetime 
 			ORDER BY datetime ASC
 		`

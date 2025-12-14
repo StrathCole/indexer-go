@@ -38,6 +38,7 @@ type DatabaseConfig struct {
 type NodeConfig struct {
 	RPC  string `mapstructure:"rpc"`
 	GRPC string `mapstructure:"grpc"`
+	LCD  string `mapstructure:"lcd"`
 }
 
 type IngestConfig struct {
@@ -64,6 +65,7 @@ func LoadConfig(path string) (*Config, error) {
 	v.SetDefault("database.postgres_conn", "postgres://user:password@localhost:5432/fcd")
 	v.SetDefault("node.rpc", "http://localhost:26657")
 	v.SetDefault("node.grpc", "localhost:9090")
+	v.SetDefault("node.lcd", "")
 	v.SetDefault("ingest.block_poll_interval", "1s")
 	v.SetDefault("ingest.backfill_interval", "0s")
 	v.SetDefault("ingest.backfill_batch_size", 10)
