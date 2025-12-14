@@ -20,6 +20,8 @@ type RichlistService struct {
 	updateInterval time.Duration
 }
 
+const richlistFullRebuildInterval = 7 * 24 * time.Hour
+
 func NewRichlistService(pg *db.Postgres, clientCtx client.Context, updateInterval time.Duration) *RichlistService {
 	return &RichlistService{
 		pg:             pg,
@@ -48,29 +50,103 @@ func (s *RichlistService) UpdateRichlist(ctx context.Context) {
 
 	log.Println("Updating richlist...")
 
+	bankClient := banktypes.NewQueryClient(s.clientCtx)
+
+	// Ensure metadata row exists and load schedule state.
+	_, _ = s.pg.Pool.Exec(ctx, "INSERT INTO rich_list_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+
+	var lastFull time.Time
+	var lastInc time.Time
+	err := s.pg.Pool.QueryRow(ctx, "SELECT last_full_rebuild, last_incremental_run FROM rich_list_meta WHERE id = 1").Scan(&lastFull, &lastInc)
+	if err != nil {
+		log.Printf("Failed to load rich_list_meta: %v", err)
+		return
+	}
+
+	now := time.Now().UTC()
+	needFull := now.Sub(lastFull) >= richlistFullRebuildInterval
+	if needFull {
+		log.Println("Running full richlist rebuild")
+		if err := s.fullRebuild(ctx, bankClient); err != nil {
+			log.Printf("Full richlist rebuild failed: %v", err)
+			return
+		}
+		_, _ = s.pg.Pool.Exec(ctx, "UPDATE rich_list_meta SET last_full_rebuild = $1, last_incremental_run = $1 WHERE id = 1", now)
+		log.Println("Richlist full rebuild complete")
+		return
+	}
+
+	if lastInc.Before(lastFull) {
+		lastInc = lastFull
+	}
+
+	log.Printf("Running incremental richlist update (since %s)", lastInc.Format(time.RFC3339))
+	if err := s.incrementalUpdate(ctx, bankClient, lastInc); err != nil {
+		log.Printf("Incremental richlist update failed: %v", err)
+		return
+	}
+	_, _ = s.pg.Pool.Exec(ctx, "UPDATE rich_list_meta SET last_incremental_run = $1 WHERE id = 1", now)
+	log.Println("Richlist incremental update complete")
+}
+
+func (s *RichlistService) buildSupplyMap(ctx context.Context, bankClient banktypes.QueryClient) (map[string]float64, error) {
+	supplyMap := make(map[string]float64)
+
+	var nextKey []byte
+	for {
+		req := &banktypes.QueryTotalSupplyRequest{
+			Pagination: &query.PageRequest{
+				Key:   nextKey,
+				Limit: 1000,
+			},
+		}
+		supplyResp, err := bankClient.TotalSupply(ctx, req)
+		if err != nil {
+			return supplyMap, err
+		}
+
+		for _, coin := range supplyResp.Supply {
+			f, _ := strconv.ParseFloat(coin.Amount.String(), 64)
+			supplyMap[coin.Denom] = f
+		}
+
+		if supplyResp.Pagination == nil || len(supplyResp.Pagination.NextKey) == 0 {
+			break
+		}
+		nextKey = supplyResp.Pagination.NextKey
+	}
+
+	return supplyMap, nil
+}
+
+func (s *RichlistService) fullRebuild(ctx context.Context, bankClient banktypes.QueryClient) error {
 	// Use cursor-based pagination to avoid loading all addresses into memory
 	const batchSize = 1000
 	var lastID int64 = 0
 
-	// 2. Fetch balances and aggregate
-	type AccBal struct {
-		Address string
-		Amount  string
+	supplyMap, err := s.buildSupplyMap(ctx, bankClient)
+	if err != nil {
+		return err
 	}
-	richList := make(map[string][]AccBal)
 
-	bankClient := banktypes.NewQueryClient(s.clientCtx)
+	tx, err := s.pg.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "TRUNCATE TABLE rich_list"); err != nil {
+		return err
+	}
 
 	for {
-		// Fetch addresses in batches using cursor pagination
-		rows, err := s.pg.Pool.Query(ctx, 
-			"SELECT id, address FROM addresses WHERE id > $1 ORDER BY id LIMIT $2", 
-			lastID, batchSize)
+		rows, err := s.pg.Pool.Query(ctx,
+			"SELECT id, address FROM addresses WHERE id > $1 ORDER BY id LIMIT $2",
+			lastID, batchSize,
+		)
 		if err != nil {
-			log.Printf("Failed to fetch addresses: %v", err)
-			return
+			return err
 		}
-
 		var addresses []string
 		var maxID int64
 		for rows.Next() {
@@ -86,99 +162,173 @@ func (s *RichlistService) UpdateRichlist(ctx context.Context) {
 		rows.Close()
 
 		if len(addresses) == 0 {
-			break // No more addresses
+			break
 		}
-
 		lastID = maxID
 
-		// Process this batch of addresses
 		for _, addr := range addresses {
 			// Rate limit
 			time.Sleep(10 * time.Millisecond)
 
-			resp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{Address: addr})
-			if err != nil {
-				continue
-			}
-
-			for _, coin := range resp.Balances {
-				richList[coin.Denom] = append(richList[coin.Denom], AccBal{
+			var balNextKey []byte
+			for {
+				resp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{
 					Address: addr,
-					Amount:  coin.Amount.String(),
+					Pagination: &query.PageRequest{
+						Key:   balNextKey,
+						Limit: 1000,
+					},
 				})
+				if err != nil {
+					break
+				}
+
+				for _, coin := range resp.Balances {
+					total := supplyMap[coin.Denom]
+					amountF, _ := strconv.ParseFloat(coin.Amount.String(), 64)
+					percentage := 0.0
+					if total > 0 {
+						percentage = amountF / total
+					}
+
+					_, err := tx.Exec(ctx,
+						"INSERT INTO rich_list (denom, account, amount, percentage) VALUES ($1, $2, $3, $4)",
+						coin.Denom, addr, coin.Amount.String(), percentage,
+					)
+					if err != nil {
+						log.Printf("Failed to insert rich list entry: %v", err)
+					}
+				}
+
+				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+					break
+				}
+				balNextKey = resp.Pagination.NextKey
 			}
 		}
 
-		// If we got fewer than batchSize, we're done
 		if len(addresses) < batchSize {
 			break
 		}
 	}
 
-	// 3. Update DB
-	tx, err := s.pg.Pool.Begin(ctx)
-	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
-		return
-	}
-	defer tx.Rollback(ctx)
+	return tx.Commit(ctx)
+}
 
-	_, err = tx.Exec(ctx, "TRUNCATE TABLE rich_list")
+func (s *RichlistService) incrementalUpdate(ctx context.Context, bankClient banktypes.QueryClient, since time.Time) error {
+	const batchSize = 1000
+	var lastID int64 = 0
+
+	supplyMap, err := s.buildSupplyMap(ctx, bankClient)
 	if err != nil {
-		log.Printf("Failed to truncate rich_list: %v", err)
-		return
+		return err
 	}
 
-	supplyMap := make(map[string]float64)
-
-	var nextKey []byte
 	for {
-		req := &banktypes.QueryTotalSupplyRequest{
-			Pagination: &query.PageRequest{
-				Key:   nextKey,
-				Limit: 1000,
-			},
-		}
-		supplyResp, err := bankClient.TotalSupply(ctx, req)
+		rows, err := s.pg.Pool.Query(ctx,
+			"SELECT id, address FROM addresses WHERE last_seen_at >= $1 AND id > $2 ORDER BY id LIMIT $3",
+			since, lastID, batchSize,
+		)
 		if err != nil {
-			log.Printf("Failed to fetch total supply: %v", err)
-			break
+			return err
 		}
-
-		for _, coin := range supplyResp.Supply {
-			f, _ := strconv.ParseFloat(coin.Amount.String(), 64)
-			supplyMap[coin.Denom] = f
+		type addrRow struct {
+			id      int64
+			address string
 		}
-
-		if supplyResp.Pagination == nil || len(supplyResp.Pagination.NextKey) == 0 {
-			break
-		}
-		nextKey = supplyResp.Pagination.NextKey
-	}
-
-	for denom, accounts := range richList {
-		total := supplyMap[denom]
-
-		for _, acc := range accounts {
-			amountF, _ := strconv.ParseFloat(acc.Amount, 64)
-			percentage := 0.0
-			if total > 0 {
-				percentage = amountF / total
-			}
-
-			_, err := tx.Exec(ctx,
-				"INSERT INTO rich_list (denom, account, amount, percentage) VALUES ($1, $2, $3, $4)",
-				denom, acc.Address, acc.Amount, percentage,
-			)
-			if err != nil {
-				log.Printf("Failed to insert rich list entry: %v", err)
+		var batch []addrRow
+		var maxID int64
+		for rows.Next() {
+			var id int64
+			var addr string
+			if err := rows.Scan(&id, &addr); err == nil {
+				batch = append(batch, addrRow{id: id, address: addr})
+				if id > maxID {
+					maxID = id
+				}
 			}
 		}
+		rows.Close()
+
+		if len(batch) == 0 {
+			break
+		}
+		lastID = maxID
+
+		tx, err := s.pg.Pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		var batchErr error
+		for _, row := range batch {
+			// Rate limit
+			time.Sleep(10 * time.Millisecond)
+
+			// Fetch current balances
+			balances := make(map[string]string)
+			var balNextKey []byte
+			for {
+				resp, err := bankClient.AllBalances(ctx, &banktypes.QueryAllBalancesRequest{
+					Address: row.address,
+					Pagination: &query.PageRequest{
+						Key:   balNextKey,
+						Limit: 1000,
+					},
+				})
+				if err != nil {
+					balances = nil
+					break
+				}
+
+				for _, coin := range resp.Balances {
+					balances[coin.Denom] = coin.Amount.String()
+				}
+
+				if resp.Pagination == nil || len(resp.Pagination.NextKey) == 0 {
+					break
+				}
+				balNextKey = resp.Pagination.NextKey
+			}
+
+			if balances == nil {
+				continue
+			}
+
+			// Replace all existing rich_list rows for this account.
+			if _, execErr := tx.Exec(ctx, "DELETE FROM rich_list WHERE account = $1", row.address); execErr != nil {
+				batchErr = execErr
+				break
+			}
+
+			for denom, amount := range balances {
+				total := supplyMap[denom]
+				amountF, _ := strconv.ParseFloat(amount, 64)
+				percentage := 0.0
+				if total > 0 {
+					percentage = amountF / total
+				}
+
+				if _, execErr := tx.Exec(ctx,
+					"INSERT INTO rich_list (denom, account, amount, percentage) VALUES ($1, $2, $3, $4)",
+					denom, row.address, amount, percentage,
+				); execErr != nil {
+					log.Printf("Failed to insert rich list entry: %v", execErr)
+				}
+			}
+		}
+
+		if batchErr != nil {
+			_ = tx.Rollback(ctx)
+			return batchErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+
+		if len(batch) < batchSize {
+			break
+		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
-	}
-
-	log.Println("Richlist updated")
+	return nil
 }

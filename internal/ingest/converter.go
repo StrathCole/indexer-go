@@ -331,7 +331,7 @@ func (s *Service) extractAccountTxs(
 
 	// Create AccountTx entries for each unique address
 	for address, direction := range addressDirections {
-		addressID, err := s.dims.GetOrCreateAddressID(ctx, address)
+		addressID, err := s.dims.GetOrCreateAddressID(ctx, address, height, blockTime)
 		if err != nil {
 			continue
 		}
@@ -440,7 +440,7 @@ func (s *Service) extractAccountBlockEvents(
 				continue
 			}
 
-			addressID, err := s.dims.GetOrCreateAddressID(ctx, value)
+			addressID, err := s.dims.GetOrCreateAddressID(ctx, value, height, blockTime)
 			if err != nil {
 				continue
 			}

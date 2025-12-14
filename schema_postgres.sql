@@ -3,11 +3,15 @@
 CREATE TABLE IF NOT EXISTS addresses (
     id        BIGSERIAL PRIMARY KEY,
     address   TEXT UNIQUE NOT NULL,
-    type      TEXT NOT NULL  -- e.g. 'account', 'contract', 'validator', 'module'
+    type      TEXT NOT NULL,  -- e.g. 'account', 'contract', 'validator', 'module'
+    last_seen_height BIGINT NOT NULL DEFAULT 0,
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT 'epoch'
 );
 
 CREATE INDEX IF NOT EXISTS idx_addresses_address ON addresses(address);
 CREATE INDEX IF NOT EXISTS idx_addresses_type    ON addresses(type);
+CREATE INDEX IF NOT EXISTS idx_addresses_last_seen_at ON addresses(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_addresses_last_seen_height ON addresses(last_seen_height);
 
 CREATE TABLE IF NOT EXISTS denoms (
     id    SMALLSERIAL PRIMARY KEY,
@@ -73,4 +77,16 @@ CREATE TABLE IF NOT EXISTS rich_list (
     updated_at  TIMESTAMP DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rich_list_denom_account ON rich_list(denom, account);
+CREATE INDEX IF NOT EXISTS idx_rich_list_account ON rich_list(account);
+
 CREATE INDEX IF NOT EXISTS idx_rich_list_denom_amount ON rich_list(denom, amount DESC);
+
+-- Rich List metadata (single-row table)
+CREATE TABLE IF NOT EXISTS rich_list_meta (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_full_rebuild     TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
+    last_incremental_run  TIMESTAMPTZ NOT NULL DEFAULT 'epoch'
+);
+
+INSERT INTO rich_list_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING;

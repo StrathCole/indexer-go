@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/classic-terra/indexer-go/internal/db"
 )
@@ -13,13 +14,18 @@ type Dimensions struct {
 	pg *db.Postgres
 
 	// Caches
-	addressCache sync.Map // map[string]uint64
+	addressCache sync.Map // map[string]addressCacheEntry
 	denomCache   sync.Map // map[string]uint16
 	msgTypeCache sync.Map // map[string]uint16
 
 	// Track address cache size for periodic cleanup
 	addressCacheSize int64
 	maxAddressCache  int64
+}
+
+type addressCacheEntry struct {
+	id             uint64
+	lastSeenHeight uint64
 }
 
 func NewDimensions(pg *db.Postgres) *Dimensions {
@@ -40,55 +46,49 @@ func (d *Dimensions) clearAddressCacheIfNeeded() {
 	}
 }
 
-func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string) (uint64, error) {
-	if id, ok := d.addressCache.Load(address); ok {
-		return id.(uint64), nil
+
+func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, lastSeenHeight uint64, lastSeenAt time.Time) (uint64, error) {
+	if v, ok := d.addressCache.Load(address); ok {
+		entry := v.(addressCacheEntry)
+		if lastSeenHeight <= entry.lastSeenHeight {
+			return entry.id, nil
+		}
+
+		// Update last-seen marker for known addresses, but only when height moves forward.
+		_, err := d.pg.Pool.Exec(ctx,
+			`UPDATE addresses
+			 SET last_seen_height = GREATEST(last_seen_height, $2),
+			     last_seen_at = GREATEST(last_seen_at, $3)
+			 WHERE id = $1`,
+			entry.id, lastSeenHeight, lastSeenAt,
+		)
+		if err == nil {
+			entry.lastSeenHeight = lastSeenHeight
+			d.addressCache.Store(address, entry)
+		}
+		return entry.id, nil
 	}
 
 	// Check if cache needs cleanup before adding new entries
 	d.clearAddressCacheIfNeeded()
 
-	// Try to select first
 	var id uint64
-	err := d.pg.Pool.QueryRow(ctx, "SELECT id FROM addresses WHERE address = $1", address).Scan(&id)
-	if err == nil {
-		d.addressCache.Store(address, id)
-		atomic.AddInt64(&d.addressCacheSize, 1)
-		return id, nil
-	}
-
-	// Insert if not found
-	// We use ON CONFLICT DO NOTHING and then select again to handle race conditions
-	// Or we can use RETURNING id if we are sure about uniqueness constraint handling
-	// A common pattern is:
-	// WITH ins AS (
-	//   INSERT INTO addresses (address, type) VALUES ($1, 'account')
-	//   ON CONFLICT (address) DO NOTHING
-	//   RETURNING id
-	// )
-	// SELECT id FROM ins
-	// UNION ALL
-	// SELECT id FROM addresses WHERE address = $1
-	// LIMIT 1;
-
+	var storedHeight uint64
 	query := `
-		WITH ins AS (
-			INSERT INTO addresses (address, type) VALUES ($1, 'account')
-			ON CONFLICT (address) DO NOTHING
-			RETURNING id
-		)
-		SELECT id FROM ins
-		UNION ALL
-		SELECT id FROM addresses WHERE address = $1
-		LIMIT 1;
+		INSERT INTO addresses (address, type, last_seen_height, last_seen_at)
+		VALUES ($1, 'account', $2, $3)
+		ON CONFLICT (address) DO UPDATE
+		SET last_seen_height = GREATEST(addresses.last_seen_height, EXCLUDED.last_seen_height),
+		    last_seen_at = GREATEST(addresses.last_seen_at, EXCLUDED.last_seen_at)
+		RETURNING id, last_seen_height;
 	`
 
-	err = d.pg.Pool.QueryRow(ctx, query, address).Scan(&id)
+	err := d.pg.Pool.QueryRow(ctx, query, address, lastSeenHeight, lastSeenAt).Scan(&id, &storedHeight)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get or create address id: %w", err)
 	}
 
-	d.addressCache.Store(address, id)
+	d.addressCache.Store(address, addressCacheEntry{id: id, lastSeenHeight: storedHeight})
 	atomic.AddInt64(&d.addressCacheSize, 1)
 	return id, nil
 }
