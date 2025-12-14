@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/model"
@@ -15,6 +16,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/types/query"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/gorilla/mux"
+	"github.com/rs/zerolog/log"
 )
 
 func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
@@ -417,13 +419,16 @@ func (s *Server) getValidatorMap(ctx context.Context) (map[string]map[string]str
 }
 
 func (s *Server) GetBlockLatest(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	var block model.Block
-	err := s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM blocks ORDER BY height DESC LIMIT 1").ScanStruct(&block)
+	err := s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks ORDER BY height DESC LIMIT 1").ScanStruct(&block)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get latest block: %v", err))
 		return
 	}
-	s.respondBlock(w, block)
+	s.respondBlock(r.Context(), w, block)
 }
 
 func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
@@ -435,13 +440,16 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	var block model.Block
-	err = s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM blocks PREWHERE height = ? LIMIT 1", height).ScanStruct(&block)
+	err = s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks PREWHERE height = ? LIMIT 1", height).ScanStruct(&block)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Block not found")
 		return
 	}
-	s.respondBlock(w, block)
+	s.respondBlock(r.Context(), w, block)
 }
 
 // GetBlockEvents returns block events for a specific height, optionally filtered by account
@@ -557,27 +565,103 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
-	// Fetch Txs for this block
-	var txs []model.Tx
-	sql := `SELECT * FROM txs WHERE height = ? ORDER BY index_in_block ASC`
-	err := s.ch.Conn.Select(context.Background(), &txs, sql, block.Height)
-	if err != nil {
-		// Log error, but continue with empty txs
-		txs = []model.Tx{}
-	}
+func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block model.Block) {
+	start := time.Now()
+	logCtx := log.With().Uint64("height", block.Height).Logger()
 
-	// Fetch Denoms
-	denoms, _ := s.getDenoms(context.Background())
-	if denoms == nil {
-		denoms = make(map[uint16]string)
-	}
+	// Fetch in parallel to minimize total latency.
+	// ClickHouse queries, Postgres dimension lookups, and validator-map gRPC are independent.
+	var (
+		txs       []model.Tx
+		dbEvents  []model.Event
+		denoms    map[uint16]string
+		msgTypes  map[uint16]string
+		valMap    map[string]map[string]string
+		valMapErr error
+	)
 
-	// Fetch MsgTypes
-	msgTypes, _ := s.getMsgTypes(context.Background())
-	if msgTypes == nil {
-		msgTypes = make(map[uint16]string)
-	}
+	var wg sync.WaitGroup
+
+	// 1) Txs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		txsStart := time.Now()
+		ctxTxs, cancelTxs := context.WithTimeout(ctx, 20*time.Second)
+		defer cancelTxs()
+		sql := `SELECT * FROM txs PREWHERE height = ? ORDER BY index_in_block ASC`
+		if err := s.ch.Conn.Select(ctxTxs, &txs, sql, block.Height); err != nil {
+			txs = []model.Tx{}
+		}
+		if d := time.Since(txsStart); d > 200*time.Millisecond {
+			logCtx.Info().Dur("txs_query", d).Msg("Slow block txs query")
+		}
+	}()
+
+	// 2) Block events (begin/end)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		eventsStart := time.Now()
+		ctxEvents, cancelEvents := context.WithTimeout(ctx, 20*time.Second)
+		defer cancelEvents()
+		sqlEvents := `SELECT * FROM events PREWHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
+		if err := s.ch.Conn.Select(ctxEvents, &dbEvents, sqlEvents, block.Height); err != nil {
+			dbEvents = nil
+		}
+		if d := time.Since(eventsStart); d > 200*time.Millisecond {
+			logCtx.Info().Dur("events_query", d).Msg("Slow block events query")
+		}
+	}()
+
+	// 3) Denoms (PG, usually cached)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		denomStart := time.Now()
+		ctxDenoms, cancelDenoms := context.WithTimeout(ctx, 2*time.Second)
+		defer cancelDenoms()
+		m, _ := s.getDenoms(ctxDenoms)
+		if m == nil {
+			m = make(map[uint16]string)
+		}
+		denoms = m
+		if d := time.Since(denomStart); d > 200*time.Millisecond {
+			logCtx.Info().Dur("denoms", d).Msg("Slow denoms fetch")
+		}
+	}()
+
+	// 4) MsgTypes (PG, usually cached)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		msgTypeStart := time.Now()
+		ctxMsgTypes, cancelMsgTypes := context.WithTimeout(ctx, 2*time.Second)
+		defer cancelMsgTypes()
+		m, _ := s.getMsgTypes(ctxMsgTypes)
+		if m == nil {
+			m = make(map[uint16]string)
+		}
+		msgTypes = m
+		if d := time.Since(msgTypeStart); d > 200*time.Millisecond {
+			logCtx.Info().Dur("msg_types", d).Msg("Slow msg types fetch")
+		}
+	}()
+
+	// 5) Validator map (gRPC, cached but can spike)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		valStart := time.Now()
+		ctxVals, cancelVals := context.WithTimeout(ctx, 3*time.Second)
+		defer cancelVals()
+		valMap, valMapErr = s.getValidatorMap(ctxVals)
+		if d := time.Since(valStart); d > 200*time.Millisecond {
+			logCtx.Info().Dur("validator_map", d).Msg("Slow validator map fetch")
+		}
+	}()
+
+	wg.Wait()
 
 	// Map Txs
 	var fcdTxs []FCDTxResponse
@@ -589,10 +673,9 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	}
 
 	// Fetch Proposer Info (Validator)
-	valMap, err := s.getValidatorMap(context.Background())
-	if err != nil {
-		// Log error
-		fmt.Printf("Failed to get validator map: %v\n", err)
+	if valMapErr != nil {
+		// Non-fatal: fall back to raw proposer address.
+		logCtx.Warn().Err(valMapErr).Msg("Failed to get validator map")
 	}
 	var proposer map[string]string
 	if valMap != nil {
@@ -608,14 +691,8 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	}
 
 	// Fetch Block Events (BeginBlock and EndBlock only)
-	var dbEvents []model.Event
-	// Fetch events for the block, excluding tx events
-	// Order by scope to ensure begin_block (2) comes before end_block (3). 'block' (0) is legacy and comes first.
-	sqlEvents := `SELECT * FROM events PREWHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
-	err = s.ch.Conn.Select(context.Background(), &dbEvents, sqlEvents, block.Height)
-
 	var blockEvents []map[string]interface{}
-	if err == nil && len(dbEvents) > 0 {
+	if len(dbEvents) > 0 {
 		// Group by (Scope, TxIndex, EventIndex)
 		var currentEvent map[string]interface{}
 		var currentAttrs []map[string]string
@@ -674,6 +751,10 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 		"proposer":  proposer,
 		"txs":       fcdTxs,
 		"events":    blockEvents,
+	}
+
+	if d := time.Since(start); d > 5*time.Second {
+		logCtx.Info().Dur("duration", d).Int("txs", len(fcdTxs)).Int("events", len(blockEvents)).Msg("Slow block response")
 	}
 
 	respondJSON(w, http.StatusOK, response)
