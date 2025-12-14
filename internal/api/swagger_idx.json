@@ -1,9 +1,9 @@
 {
   "swagger": "2.0",
   "info": {
-    "title": "Terra Classic Indexer API (FCD compatible)",
+    "title": "Terra Classic Indexer API",
     "version": "1.0.0",
-    "description": "FCD-compatible endpoints served by indexer-api. This is intended to be merged with an LCD swagger spec for a comprehensive API doc set."
+    "description": "Endpoints served by the indexer API."
   },
   "schemes": ["https", "http"],
   "consumes": ["application/json"],
