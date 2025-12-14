@@ -254,10 +254,49 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "Invalid hash format")
 		return
 	}
+	if _, err := hex.DecodeString(hash); err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid hash format")
+		return
+	}
+
+	normalizedHash := strings.ToUpper(hash)
+
+	// ClickHouse is ordered by (height, index_in_block), not tx_hash.
+	// Avoid `SELECT * ... WHERE tx_hash = ?` which forces wide scans.
+	// Instead: locate (height, index) with a narrow query, then fetch the full row by primary key.
+	type txLocation struct {
+		Height       uint64
+		IndexInBlock uint16
+	}
+
+	var loc txLocation
+	if cached, found := s.cache.Get("tx_loc_" + normalizedHash); found {
+		if v, ok := cached.(txLocation); ok {
+			loc = v
+		}
+	}
+
+	if loc.Height == 0 {
+		err := s.ch.Conn.QueryRow(
+			context.Background(),
+			"SELECT height, index_in_block FROM txs PREWHERE tx_hash = ? LIMIT 1",
+			normalizedHash,
+		).Scan(&loc.Height, &loc.IndexInBlock)
+		if err != nil {
+			respondError(w, http.StatusNotFound, "Transaction not found")
+			return
+		}
+		// Cache hash->(height,index) mapping for quick repeated lookups.
+		s.cache.Set("tx_loc_"+normalizedHash, loc, 1*time.Hour)
+	}
 
 	var tx model.Tx
-	// tx_hash is FixedString(64) (hex string)
-	err := s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM txs WHERE tx_hash = ?", strings.ToUpper(hash)).ScanStruct(&tx)
+	err := s.ch.Conn.QueryRow(
+		context.Background(),
+		"SELECT * FROM txs WHERE height = ? AND index_in_block = ? LIMIT 1",
+		loc.Height,
+		loc.IndexInBlock,
+	).ScanStruct(&tx)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Transaction not found")
 		return
@@ -279,7 +318,12 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getDenoms(ctx context.Context) (map[uint16]string, error) {
-	// TODO: Cache this
+	if cached, found := s.cache.Get("denoms"); found {
+		if denoms, ok := cached.(map[uint16]string); ok {
+			return denoms, nil
+		}
+	}
+
 	rows, err := s.pg.Pool.Query(ctx, "SELECT id, denom FROM denoms")
 	if err != nil {
 		return nil, err
@@ -294,11 +338,17 @@ func (s *Server) getDenoms(ctx context.Context) (map[uint16]string, error) {
 			denoms[id] = denom
 		}
 	}
+	s.cache.Set("denoms", denoms, 10*time.Minute)
 	return denoms, nil
 }
 
 func (s *Server) getMsgTypes(ctx context.Context) (map[uint16]string, error) {
-	// TODO: Cache this
+	if cached, found := s.cache.Get("msg_types"); found {
+		if msgTypes, ok := cached.(map[uint16]string); ok {
+			return msgTypes, nil
+		}
+	}
+
 	rows, err := s.pg.Pool.Query(ctx, "SELECT id, msg_type FROM msg_types")
 	if err != nil {
 		return nil, err
@@ -313,6 +363,7 @@ func (s *Server) getMsgTypes(ctx context.Context) (map[uint16]string, error) {
 			msgTypes[id] = msgType
 		}
 	}
+	s.cache.Set("msg_types", msgTypes, 10*time.Minute)
 	return msgTypes, nil
 }
 
@@ -385,7 +436,7 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var block model.Block
-	err = s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM blocks WHERE height = ?", height).ScanStruct(&block)
+	err = s.ch.Conn.QueryRow(context.Background(), "SELECT * FROM blocks PREWHERE height = ? LIMIT 1", height).ScanStruct(&block)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Block not found")
 		return
@@ -420,7 +471,7 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Query events
-	sql := fmt.Sprintf(`SELECT * FROM events WHERE height = ? %s ORDER BY scope ASC, event_index ASC`, scopeFilter)
+	sql := fmt.Sprintf(`SELECT * FROM events PREWHERE height = ? %s ORDER BY scope ASC, event_index ASC`, scopeFilter)
 	var dbEvents []model.Event
 	err = s.ch.Conn.Select(context.Background(), &dbEvents, sql, height)
 	if err != nil {
@@ -560,7 +611,7 @@ func (s *Server) respondBlock(w http.ResponseWriter, block model.Block) {
 	var dbEvents []model.Event
 	// Fetch events for the block, excluding tx events
 	// Order by scope to ensure begin_block (2) comes before end_block (3). 'block' (0) is legacy and comes first.
-	sqlEvents := `SELECT * FROM events WHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
+	sqlEvents := `SELECT * FROM events PREWHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
 	err = s.ch.Conn.Select(context.Background(), &dbEvents, sqlEvents, block.Height)
 
 	var blockEvents []map[string]interface{}

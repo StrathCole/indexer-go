@@ -94,6 +94,20 @@ You can apply the schema directly using the `clickhouse-client` and the `schema.
 clickhouse-client --user fcd_user --password password --database=fcd --multiquery < schema.sql
 ```
 
+If you already have an existing `txs` table, make sure it has a data-skipping index on `tx_hash` (used by the single-tx endpoint `/v1/txs/{hash}`). You can add it and materialize it like this:
+
+```sql
+ALTER TABLE txs ADD INDEX IF NOT EXISTS idx_tx_hash tx_hash TYPE bloom_filter(0.01) GRANULARITY 4;
+ALTER TABLE txs MATERIALIZE INDEX idx_tx_hash;
+```
+
+For fast block-by-height endpoints (which query block-level events by height), it also helps to have a skipping index on `events.height`:
+
+```sql
+ALTER TABLE events ADD INDEX IF NOT EXISTS idx_events_height height TYPE minmax GRANULARITY 1;
+ALTER TABLE events MATERIALIZE INDEX idx_events_height;
+```
+
 ### Verification
 
 To verify the setup, you can check if the tables exist.

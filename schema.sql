@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS txs (
     index_in_block  UInt16,
     block_time      DateTime64(3),
     tx_hash         FixedString(64),
+    INDEX idx_tx_hash tx_hash TYPE bloom_filter(0.01) GRANULARITY 4,
     codespace       LowCardinality(String),
     code            UInt32,
     gas_wanted      UInt64,
@@ -38,6 +39,7 @@ ORDER BY (height, index_in_block);
 
 CREATE TABLE IF NOT EXISTS events (
     height          UInt64,
+    INDEX idx_events_height height TYPE minmax GRANULARITY 1,
     block_time      DateTime64(3),
     scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
     tx_index        Int16,                 -- -1 for block-level events
