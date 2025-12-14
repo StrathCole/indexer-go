@@ -1,0 +1,579 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Terra Classic Indexer API (FCD compatible)",
+    "version": "1.0.0",
+    "description": "FCD-compatible endpoints served by indexer-api. This is intended to be merged with an LCD swagger spec for a comprehensive API doc set."
+  },
+  "schemes": ["https", "http"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["Root"],
+        "summary": "Service status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/RootResponse" },
+            "examples": {
+              "application/json": {
+                "name": "Terra Classic Indexer API",
+                "version": "1.0.0",
+                "status": "online"
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/v1/dashboard": { "get": { "tags": ["Dashboard"], "summary": "Dashboard overview", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/tx_volume": { "get": { "tags": ["Dashboard"], "summary": "Transaction volume", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/block_rewards": { "get": { "tags": ["Dashboard"], "summary": "Block rewards", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/seigniorage_proceeds": {
+      "get": {
+        "tags": ["Dashboard"],
+        "summary": "Seigniorage proceeds",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "array", "items": { "$ref": "#/definitions/SeigniorageProceedsEntry" } },
+            "examples": {
+              "application/json": [
+                {
+                  "datetime": 1704067200000,
+                  "seigniorageProceeds": "123456789.0000000000"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "/v1/dashboard/staking_return": {
+      "get": {
+        "tags": ["Dashboard"],
+        "summary": "Staking return",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "array", "items": { "$ref": "#/definitions/StakingReturnEntry" } },
+            "examples": {
+              "application/json": [
+                {
+                  "datetime": 1704067200000,
+                  "dailyReturn": "0",
+                  "annualizedReturn": "0"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "/v1/dashboard/staking_ratio": {
+      "get": {
+        "tags": ["Dashboard"],
+        "summary": "Staking ratio",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "array", "items": { "$ref": "#/definitions/StakingRatioEntry" } },
+            "examples": {
+              "application/json": [
+                {
+                  "datetime": 1704067200000,
+                  "stakingRatio": 0.123456
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "/v1/dashboard/account_growth": { "get": { "tags": ["Dashboard"], "summary": "Account growth", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/active_accounts": { "get": { "tags": ["Dashboard"], "summary": "Active accounts", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/registered_accounts": { "get": { "tags": ["Dashboard"], "summary": "Registered accounts", "responses": { "200": { "description": "OK" } } } },
+    "/v1/dashboard/last_hour_ops_txs_count": { "get": { "tags": ["Dashboard"], "summary": "Last-hour ops + txs count", "responses": { "200": { "description": "OK" } } } },
+
+    "/v1/txs/gas_prices": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Gas prices",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/GasPricesResult" },
+            "examples": {
+              "application/json": {
+                "uluna": "28.325",
+                "uusd": "0.75"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/txs": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "List transactions",
+        "parameters": [
+          { "name": "account", "in": "query", "required": false, "type": "string" },
+          { "name": "block", "in": "query", "required": false, "type": "string" },
+          { "name": "limit", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "offset", "in": "query", "required": false, "type": "integer", "format": "int32" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/TxListResponse" },
+            "examples": {
+              "application/json": {
+                "txs": [
+                  {
+                    "id": 2612660700000,
+                    "chainId": "columbus-5",
+                    "height": "26126607",
+                    "txhash": "773AF762F9A82C12F3BA3E26C3BA6F57C1930BBF7B1CA88358664CD7D68D2950",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                    "raw_log": "[]",
+                    "gas_used": "0",
+                    "gas_wanted": "0",
+                    "tx": {
+                      "type": "core/StdTx",
+                      "value": {
+                        "fee": { "gas": "0", "amount": [] },
+                        "msg": [],
+                        "memo": "",
+                        "signatures": [],
+                        "timeout_height": "0",
+                        "tax": ""
+                      }
+                    },
+                    "logs": []
+                  }
+                ],
+                "limit": 10,
+                "next": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/txs/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get transaction by hash",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/FCDTxResponse" }
+          },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/v1/tx/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get transaction by hash (alias)",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/FCDTxResponse" }
+          },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+    "/v1/mempool": { "get": { "tags": ["Transactions"], "summary": "Mempool transactions", "responses": { "200": { "description": "OK" } } } },
+    "/v1/mempool/{hash}": {
+      "get": {
+        "tags": ["Transactions"],
+        "summary": "Get mempool transaction by hash",
+        "parameters": [
+          { "name": "hash", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/blocks/latest": { "get": { "tags": ["Blocks"], "summary": "Latest block", "responses": { "200": { "description": "OK" } } } },
+    "/v1/blocks/{height}": {
+      "get": {
+        "tags": ["Blocks"],
+        "summary": "Get block by height",
+        "parameters": [
+          { "name": "height", "in": "path", "required": true, "type": "integer", "format": "int64" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/blocks/{height}/events": {
+      "get": {
+        "tags": ["Blocks"],
+        "summary": "Get block events by height",
+        "parameters": [
+          { "name": "height", "in": "path", "required": true, "type": "integer", "format": "int64" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/bank/{account}": {
+      "get": {
+        "tags": ["Bank"],
+        "summary": "Balances for account",
+        "parameters": [
+          { "name": "account", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/GetBankResult" },
+            "examples": {
+              "application/json": {
+                "balance": [
+                  {
+                    "denom": "uluna",
+                    "available": "1000000",
+                    "delegatable": "1000000",
+                    "delegatedVesting": "0",
+                    "freedVesting": "0",
+                    "remainingVesting": "0",
+                    "unbonding": "0"
+                  }
+                ],
+                "vesting": [],
+                "delegations": [],
+                "unbondings": []
+              }
+            }
+          },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+
+    "/v1/market/price": {
+      "get": {
+        "tags": ["Market"],
+        "summary": "Market price",
+        "parameters": [
+          { "name": "denom", "in": "query", "required": true, "type": "string" },
+          { "name": "interval", "in": "query", "required": false, "type": "string", "enum": ["1m", "5m", "15m", "30m", "1h", "1d"] }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "$ref": "#/definitions/MarketPriceResult" },
+            "examples": {
+              "application/json": {
+                "lastPrice": 1.2345,
+                "oneDayVariation": "0.01",
+                "oneDayVariationRate": "0.0081",
+                "prices": [
+                  { "denom": "uusd", "datetime": 1704067200000, "price": 1.20 },
+                  { "denom": "uusd", "datetime": 1704153600000, "price": 1.23 }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "schema": { "$ref": "#/definitions/ErrorResponse" },
+            "examples": {
+              "application/json": {
+                "code": 400,
+                "message": "child \"denom\" fails because [\"denom\" is required]",
+                "type": "INVALID_REQUEST_ERROR"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/market/swaprate/{base}": {
+      "get": {
+        "tags": ["Market"],
+        "summary": "Market swap rate",
+        "parameters": [
+          { "name": "base", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": { "type": "array", "items": { "$ref": "#/definitions/SwapRateEntry" } },
+            "examples": {
+              "application/json": [
+                { "denom": "uluna", "swaprate": "1", "oneDayVariation": "0", "oneDayVariationRate": "0" },
+                { "denom": "uusd", "swaprate": "0.75", "oneDayVariation": "0.01", "oneDayVariationRate": "0.013" }
+              ]
+            }
+          },
+          "404": { "description": "Not found" }
+        }
+      }
+    },
+
+    "/v1/staking/validators": { "get": { "tags": ["Staking"], "summary": "List validators", "responses": { "200": { "description": "OK" } } } },
+    "/v1/staking/validators/{operatorAddr}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Get validator",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/validators/{operatorAddr}/claims": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Validator claims",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/account/{account}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Staking account",
+        "parameters": [
+          { "name": "account", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/staking/return": { "get": { "tags": ["Staking"], "summary": "Total staking return", "responses": { "200": { "description": "OK" } } } },
+    "/v1/staking/return/{operatorAddr}": {
+      "get": {
+        "tags": ["Staking"],
+        "summary": "Validator staking return",
+        "parameters": [
+          { "name": "operatorAddr", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+
+    "/v1/taxproceeds": { "get": { "tags": ["Treasury"], "summary": "Tax proceeds", "responses": { "200": { "description": "OK" } } } },
+    "/v1/richlist/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Richlist for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" },
+          { "name": "page", "in": "query", "required": false, "type": "integer", "format": "int32" },
+          { "name": "limit", "in": "query", "required": false, "type": "integer", "format": "int32" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/totalsupply/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Total supply for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/circulatingsupply/{denom}": {
+      "get": {
+        "tags": ["Treasury"],
+        "summary": "Circulating supply for denom",
+        "parameters": [
+          { "name": "denom", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } }
+      }
+    }
+  },
+  "definitions": {
+    "RootResponse": {
+      "type": "object",
+      "required": ["name", "version", "status"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["code", "message", "type"],
+      "properties": {
+        "code": { "type": "integer", "format": "int32" },
+        "message": { "type": "string" },
+        "type": { "type": "string" }
+      }
+    },
+    "GasPricesResult": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "BankBalanceEntry": {
+      "type": "object",
+      "required": ["denom", "available", "delegatable", "delegatedVesting", "freedVesting", "remainingVesting", "unbonding"],
+      "properties": {
+        "denom": { "type": "string" },
+        "available": { "type": "string" },
+        "delegatable": { "type": "string" },
+        "delegatedVesting": { "type": "string" },
+        "freedVesting": { "type": "string" },
+        "remainingVesting": { "type": "string" },
+        "unbonding": { "type": "string" }
+      }
+    },
+    "GetBankResult": {
+      "type": "object",
+      "required": ["balance", "vesting", "delegations", "unbondings"],
+      "properties": {
+        "balance": { "type": "array", "items": { "$ref": "#/definitions/BankBalanceEntry" } },
+        "vesting": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "delegations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "unbondings": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+    "MarketPricePoint": {
+      "type": "object",
+      "required": ["denom", "datetime", "price"],
+      "properties": {
+        "denom": { "type": "string" },
+        "datetime": { "type": "integer", "format": "int64" },
+        "price": { "type": "number", "format": "double" }
+      }
+    },
+    "MarketPriceResult": {
+      "type": "object",
+      "required": ["lastPrice", "oneDayVariation", "oneDayVariationRate", "prices"],
+      "properties": {
+        "lastPrice": { "type": "number", "format": "double" },
+        "oneDayVariation": { "type": "string" },
+        "oneDayVariationRate": { "type": "string" },
+        "prices": { "type": "array", "items": { "$ref": "#/definitions/MarketPricePoint" } }
+      }
+    },
+    "SwapRateEntry": {
+      "type": "object",
+      "required": ["denom", "swaprate", "oneDayVariation", "oneDayVariationRate"],
+      "properties": {
+        "denom": { "type": "string" },
+        "swaprate": { "type": "string" },
+        "oneDayVariation": { "type": "string" },
+        "oneDayVariationRate": { "type": "string" }
+      }
+    },
+    "SeigniorageProceedsEntry": {
+      "type": "object",
+      "required": ["datetime", "seigniorageProceeds"],
+      "properties": {
+        "datetime": { "type": "integer", "format": "int64" },
+        "seigniorageProceeds": { "type": "string" }
+      }
+    },
+    "StakingReturnEntry": {
+      "type": "object",
+      "required": ["datetime", "dailyReturn", "annualizedReturn"],
+      "properties": {
+        "datetime": { "type": "integer", "format": "int64" },
+        "dailyReturn": { "type": "string" },
+        "annualizedReturn": { "type": "string" }
+      }
+    },
+    "StakingRatioEntry": {
+      "type": "object",
+      "required": ["datetime", "stakingRatio"],
+      "properties": {
+        "datetime": { "type": "integer", "format": "int64" },
+        "stakingRatio": { "type": "number", "format": "double" }
+      }
+    },
+    "TxListResponse": {
+      "type": "object",
+      "required": ["txs", "limit", "next"],
+      "properties": {
+        "txs": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "limit": { "type": "integer", "format": "int32" },
+        "next": { "type": "integer", "format": "int64" }
+      }
+    },
+    "FCDCoin": {
+      "type": "object",
+      "required": ["denom", "amount"],
+      "properties": {
+        "denom": { "type": "string" },
+        "amount": { "type": "string" }
+      }
+    },
+    "FCDFee": {
+      "type": "object",
+      "required": ["gas", "amount"],
+      "properties": {
+        "gas": { "type": "string" },
+        "amount": { "type": "array", "items": { "$ref": "#/definitions/FCDCoin" } }
+      }
+    },
+    "FCDTxValue": {
+      "type": "object",
+      "required": ["fee", "msg", "memo", "signatures", "timeout_height"],
+      "properties": {
+        "fee": { "$ref": "#/definitions/FCDFee" },
+        "msg": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "memo": { "type": "string" },
+        "signatures": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "timeout_height": { "type": "string" },
+        "tax": { "type": "string" }
+      }
+    },
+    "FCDTx": {
+      "type": "object",
+      "required": ["type", "value"],
+      "properties": {
+        "type": { "type": "string" },
+        "value": { "$ref": "#/definitions/FCDTxValue" }
+      }
+    },
+    "FCDLog": {
+      "type": "object",
+      "required": ["msg_index", "log", "events"],
+      "properties": {
+        "msg_index": { "type": "integer", "format": "int32" },
+        "log": { "type": "object", "additionalProperties": true },
+        "events": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+    "FCDTxResponse": {
+      "type": "object",
+      "required": ["id", "chainId", "tx", "logs", "height", "txhash", "raw_log", "gas_used", "timestamp", "gas_wanted"],
+      "properties": {
+        "id": { "type": "integer", "format": "int64" },
+        "chainId": { "type": "string" },
+        "tx": { "$ref": "#/definitions/FCDTx" },
+        "logs": { "type": "array", "items": { "$ref": "#/definitions/FCDLog" } },
+        "height": { "type": "string" },
+        "txhash": { "type": "string" },
+        "raw_log": { "type": "string" },
+        "gas_used": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "gas_wanted": { "type": "string" },
+        "codespace": { "type": "string" },
+        "code": { "type": "integer", "format": "int32" }
+      }
+    }
+  }
+}

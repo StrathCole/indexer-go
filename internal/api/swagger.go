@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-//go:embed swagger_fcd.json
+//go:embed swagger_idx.json
 var swaggerFCDSpecJSON []byte
 
 const swaggerUIHTML = `<!doctype html>
