@@ -124,6 +124,11 @@ func (s *RichlistService) fullRebuild(ctx context.Context, bankClient banktypes.
 	const batchSize = 1000
 	var lastID int64 = 0
 
+	// Ensure staging table exists
+	if _, err := s.pg.Pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS rich_list_build (LIKE rich_list INCLUDING ALL)"); err != nil {
+		return err
+	}
+
 	supplyMap, err := s.buildSupplyMap(ctx, bankClient)
 	if err != nil {
 		return err
@@ -135,7 +140,8 @@ func (s *RichlistService) fullRebuild(ctx context.Context, bankClient banktypes.
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "TRUNCATE TABLE rich_list"); err != nil {
+	// Build the new snapshot into the staging table, leaving rich_list readable.
+	if _, err := tx.Exec(ctx, "TRUNCATE TABLE rich_list_build"); err != nil {
 		return err
 	}
 
@@ -192,7 +198,7 @@ func (s *RichlistService) fullRebuild(ctx context.Context, bankClient banktypes.
 					}
 
 					_, err := tx.Exec(ctx,
-						"INSERT INTO rich_list (denom, account, amount, percentage) VALUES ($1, $2, $3, $4)",
+						"INSERT INTO rich_list_build (denom, account, amount, percentage) VALUES ($1, $2, $3, $4)",
 						coin.Denom, addr, coin.Amount.String(), percentage,
 					)
 					if err != nil {
@@ -212,7 +218,37 @@ func (s *RichlistService) fullRebuild(ctx context.Context, bankClient banktypes.
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// Atomically swap tables so readers always see a complete snapshot.
+	swapTx, err := s.pg.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer swapTx.Rollback(ctx)
+
+	// Rename sequence:
+	// rich_list -> rich_list_old
+	// rich_list_build -> rich_list
+	// rich_list_old -> rich_list_build (reused as the staging table)
+	if _, err := swapTx.Exec(ctx, "ALTER TABLE rich_list RENAME TO rich_list_old"); err != nil {
+		return err
+	}
+	if _, err := swapTx.Exec(ctx, "ALTER TABLE rich_list_build RENAME TO rich_list"); err != nil {
+		return err
+	}
+	if _, err := swapTx.Exec(ctx, "ALTER TABLE rich_list_old RENAME TO rich_list_build"); err != nil {
+		return err
+	}
+
+	// Clear the staging table for the next rebuild; this does not affect live reads.
+	if _, err := swapTx.Exec(ctx, "TRUNCATE TABLE rich_list_build"); err != nil {
+		return err
+	}
+
+	return swapTx.Commit(ctx)
 }
 
 func (s *RichlistService) incrementalUpdate(ctx context.Context, bankClient banktypes.QueryClient, since time.Time) error {

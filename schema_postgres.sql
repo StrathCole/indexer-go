@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS rich_list (
     updated_at  TIMESTAMP DEFAULT NOW()
 );
 
+-- Staging table for atomic richlist rebuilds
+-- Build into rich_list_build, then swap table names in a short transaction.
+CREATE TABLE IF NOT EXISTS rich_list_build (LIKE rich_list INCLUDING ALL);
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_rich_list_denom_account ON rich_list(denom, account);
 CREATE INDEX IF NOT EXISTS idx_rich_list_account ON rich_list(account);
 
