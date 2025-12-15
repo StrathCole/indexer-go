@@ -425,16 +425,16 @@ func (s *Server) getValidatorMap(ctx context.Context) (map[string]map[string]str
 }
 
 func (s *Server) GetBlockLatest(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	var block model.Block
-	err := s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks ORDER BY height DESC LIMIT 1").ScanStruct(&block)
+	err := s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks ORDER BY height DESC LIMIT 1 SETTINGS max_execution_time=10").ScanStruct(&block)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get latest block: %v", err))
 		return
 	}
-	s.respondBlock(r.Context(), w, block)
+	s.respondBlock(ctx, w, block)
 }
 
 func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
@@ -446,16 +446,16 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	var block model.Block
-	err = s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks PREWHERE height = ? LIMIT 1", height).ScanStruct(&block)
+	err = s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks PREWHERE height = ? LIMIT 1 SETTINGS max_execution_time=10", height).ScanStruct(&block)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Block not found")
 		return
 	}
-	s.respondBlock(r.Context(), w, block)
+	s.respondBlock(ctx, w, block)
 }
 
 // GetBlockEvents returns block events for a specific height, optionally filtered by account
@@ -595,8 +595,14 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 		txsStart := time.Now()
 		ctxTxs, cancelTxs := context.WithTimeout(ctx, 20*time.Second)
 		defer cancelTxs()
-		sql := `SELECT * FROM txs PREWHERE height = ? ORDER BY index_in_block ASC`
-		if err := s.ch.Conn.Select(ctxTxs, &txs, sql, block.Height); err != nil {
+		sql := `
+			SELECT *
+			FROM txs
+			PREWHERE height = ? AND toYYYYMM(block_time) = toYYYYMM(?)
+			ORDER BY index_in_block ASC
+			SETTINGS max_execution_time=10
+		`
+		if err := s.ch.Conn.Select(ctxTxs, &txs, sql, block.Height, block.BlockTime); err != nil {
 			txs = []model.Tx{}
 		}
 		if d := time.Since(txsStart); d > 200*time.Millisecond {
@@ -611,8 +617,14 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 		eventsStart := time.Now()
 		ctxEvents, cancelEvents := context.WithTimeout(ctx, 20*time.Second)
 		defer cancelEvents()
-		sqlEvents := `SELECT * FROM events PREWHERE height = ? AND scope != 'tx' ORDER BY scope ASC, event_index ASC`
-		if err := s.ch.Conn.Select(ctxEvents, &dbEvents, sqlEvents, block.Height); err != nil {
+		sqlEvents := `
+			SELECT *
+			FROM events
+			PREWHERE height = ? AND scope != 'tx' AND toYYYYMM(block_time) = toYYYYMM(?)
+			ORDER BY scope ASC, event_index ASC
+			SETTINGS max_execution_time=10
+		`
+		if err := s.ch.Conn.Select(ctxEvents, &dbEvents, sqlEvents, block.Height, block.BlockTime); err != nil {
 			dbEvents = nil
 		}
 		if d := time.Since(eventsStart); d > 200*time.Millisecond {

@@ -687,8 +687,10 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 		// Weird naming.
 
 		// We need total accounts count.
-		// We can get it from Postgres or CH.
-		_ = s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
+		// Prefer ClickHouse daily table (fast). Fallback to Postgres count(*) if needed.
+		if err := s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily").Scan(&total); err != nil || total == 0 {
+			_ = s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
+		}
 
 		if active == nil {
 			active = []Active{}
@@ -704,9 +706,14 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 	s.respondWithCache(w, "registered_accounts", 1*time.Hour, func() (interface{}, error) {
 		var total uint64
-		err := s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
-		if err != nil {
-			return nil, err
+		var err error
+		// Prefer ClickHouse daily table (fast). Fallback to Postgres count(*) if needed.
+		err = s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily").Scan(&total)
+		if err != nil || total == 0 {
+			err = s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		type Growth struct {
@@ -810,15 +817,14 @@ func (s *Server) GetLastHourOpsAndTxs(w http.ResponseWriter, r *http.Request) {
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
-	response, err := json.Marshal(payload)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(err.Error()))
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write(response)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		// Headers are already written; best-effort error body.
+		_, _ = w.Write([]byte(`{"error":"failed to encode response"}`))
+	}
 }
 
 func respondError(w http.ResponseWriter, status int, message string) {

@@ -1,10 +1,13 @@
 package api
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/classic-terra/core/v3/app"
@@ -49,6 +52,7 @@ func (s *Server) Router() http.Handler {
 	// Middleware
 	r.Use(loggingMiddleware)
 	r.Use(recoveryMiddleware)
+	r.Use(gzipMiddleware)
 	r.Use(s.corsMiddleware)
 
 	// Routes
@@ -124,6 +128,43 @@ func (s *Server) Router() http.Handler {
 	r.PathPrefix("/").Handler(gwMux)
 
 	return r
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	writer io.Writer
+}
+
+func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.writer.Write(b)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip if client doesn't accept gzip.
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Skip if already encoded.
+		if w.Header().Get("Content-Encoding") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Add("Vary", "Accept-Encoding")
+
+		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		defer gz.Close()
+
+		grw := gzipResponseWriter{ResponseWriter: w, writer: gz}
+		next.ServeHTTP(grw, r)
+	})
 }
 
 func (s *Server) GetRoot(w http.ResponseWriter, r *http.Request) {
