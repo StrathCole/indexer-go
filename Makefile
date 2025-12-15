@@ -17,6 +17,7 @@ build-tools:
 	go build -o build/fix_tax ./cmd/tools/fix_tax
 	go build -o build/fix_timestamps ./cmd/tools/fix_timestamps
 	go build -o build/backfill_account_blocks ./cmd/tools/backfill_account_blocks
+	go build -o build/backfill_dashboard_aggregates ./cmd/tools/backfill_dashboard_aggregates
 
 clean:
 	rm -rf build

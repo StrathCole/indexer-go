@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/classic-terra/indexer-go/internal/model"
 )
@@ -192,5 +193,26 @@ func (s *Service) BatchInsert(
 		}
 	}
 
+	return nil
+}
+
+func (s *Service) insertRegisteredAccountsDaily(ctx context.Context, blockTime time.Time, count uint64) error {
+	if count == 0 {
+		return nil
+	}
+
+	u := blockTime.UTC()
+	day := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
+
+	batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO registered_accounts_daily")
+	if err != nil {
+		return fmt.Errorf("failed to prepare registered_accounts_daily batch: %w", err)
+	}
+	if err := batch.Append(day, count); err != nil {
+		return fmt.Errorf("failed to append registered_accounts_daily row: %w", err)
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("failed to send registered_accounts_daily batch: %w", err)
+	}
 	return nil
 }

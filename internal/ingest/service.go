@@ -699,7 +699,7 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	modelEvents = append(modelEvents, beginBlockEvents...)
 	modelEvents = append(modelEvents, endBlockEvents...)
 
-	beginBlockAccountTxs, err := s.extractAccountBlockEvents(
+	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -712,7 +712,7 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
 	}
 
-	endBlockAccountTxs, err := s.extractAccountBlockEvents(
+	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -734,7 +734,7 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 
 		txHash := fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash())
 
-		modelTx, events, accountTxs, err := s.convertTx(
+		modelTx, events, accountTxs, _, err := s.convertTx(
 			uint64(block.Block.Height),
 			uint16(i),
 			block.Block.Time,
@@ -818,6 +818,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelTxs []model.Tx
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
+	var newAccounts uint64
 
 	// Convert Block Events (BeginBlock & EndBlock)
 	beginBlockEvents := s.convertBlockEvents(
@@ -837,7 +838,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	modelEvents = append(modelEvents, endBlockEvents...)
 
 	// Extract account activity from block events (stored in account_txs with special index values)
-	beginBlockAccountTxs, err := s.extractAccountBlockEvents(
+	beginBlockAccountTxs, beginNewAccounts, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -848,9 +849,10 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		log.Printf("Failed to extract begin_block account relations: %v", err)
 	} else {
 		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
+		newAccounts += beginNewAccounts
 	}
 
-	endBlockAccountTxs, err := s.extractAccountBlockEvents(
+	endBlockAccountTxs, endNewAccounts, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -861,6 +863,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		log.Printf("Failed to extract end_block account relations: %v", err)
 	} else {
 		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
+		newAccounts += endNewAccounts
 	}
 
 	for i, txBytes := range block.Block.Txs {
@@ -872,7 +875,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 
 		txHash := fmt.Sprintf("%X", tmtypes.Tx(txBytes).Hash())
 
-		modelTx, events, accountTxs, err := s.convertTx(
+		modelTx, events, accountTxs, txNewAccounts, err := s.convertTx(
 			uint64(block.Block.Height),
 			uint16(i),
 			block.Block.Time,
@@ -888,6 +891,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		modelTxs = append(modelTxs, *modelTx)
 		modelEvents = append(modelEvents, events...)
 		modelAccountTxs = append(modelAccountTxs, accountTxs...)
+		newAccounts += txNewAccounts
 	}
 
 	// Insert everything in one batch
@@ -895,6 +899,12 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	if err != nil {
 		log.Printf("Failed to insert block/txs: %v", err)
 		return err
+	}
+
+	if newAccounts > 0 {
+		if err := s.insertRegisteredAccountsDaily(context.Background(), block.Block.Time, newAccounts); err != nil {
+			log.Printf("Failed to update registered_accounts_daily: %v", err)
+		}
 	}
 
 	return nil

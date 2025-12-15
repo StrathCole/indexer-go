@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -498,7 +499,7 @@ func (s *Server) GetStakingRatio(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
-	s.respondWithCache(w, "account_growth", 5*time.Minute, func() (interface{}, error) {
+	s.respondWithCache(w, "account_growth", 1*time.Hour, func() (interface{}, error) {
 		type Growth struct {
 			Time   uint64 `json:"datetime" ch:"datetime"`
 			Count  uint64 `json:"totalAccountCount" ch:"totalAccount"`
@@ -510,97 +511,119 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 			Time  uint64 `ch:"datetime"`
 			Count uint64 `ch:"count"`
 		}
-		sqlActive := `
-			SELECT 
-				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
-				uniq(address_id) as count 
-			FROM account_txs 
-			GROUP BY datetime 
-			ORDER BY datetime ASC
+		sqlActiveAgg := `
+			SELECT
+				toUnixTimestamp(day) * 1000 AS datetime,
+				uniqCombined64Merge(active_state) AS count
+			FROM account_txs_daily_active
+			GROUP BY day
+			ORDER BY day ASC
 		`
-		_ = s.ch.Conn.Select(context.Background(), &active, sqlActive)
+		err := s.ch.Conn.Select(context.Background(), &active, sqlActiveAgg)
+		if err != nil {
+			sqlActiveRaw := `
+				SELECT 
+					toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
+					uniq(address_id) as count 
+				FROM account_txs 
+				GROUP BY datetime 
+				ORDER BY datetime ASC
+			`
+			_ = s.ch.Conn.Select(context.Background(), &active, sqlActiveRaw)
+		}
 		activeMap := make(map[uint64]uint64)
 		for _, a := range active {
 			activeMap[a.Time] = a.Count
 		}
 
-		// New accounts per day
+		// New accounts per day (prefer precomputed daily table).
 		var newAccs []struct {
 			Time  uint64 `ch:"datetime"`
 			Count uint64 `ch:"count"`
 		}
-		sqlNew := `
-			SELECT 
-				toUnixTimestamp(toStartOfDay(min_time))*1000 as datetime, 
-				count() as count 
-			FROM (
-				SELECT address_id, min(block_time) as min_time 
-				FROM account_txs 
-				GROUP BY address_id
-			) 
-			GROUP BY datetime 
-			ORDER BY datetime ASC
+		sqlNewDaily := `
+			SELECT
+				toUnixTimestamp(day) * 1000 AS datetime,
+				sum(value) AS count
+			FROM registered_accounts_daily
+			GROUP BY day
+			ORDER BY day ASC
 		`
-		_ = s.ch.Conn.Select(context.Background(), &newAccs, sqlNew)
-
-		var periodic []Growth
-		var cumulative []Growth
-		var total uint64 = 0
-		var cumulativeActive uint64 = 0
-
-		// We need to align dates.
-		// Iterate newAccs as base for total growth.
-		// But active accounts might exist on days with no new accounts?
-		// Yes. We should union the dates.
-		// For simplicity, we assume new accounts drive the timeline or we iterate active.
-		// Let's use a map of all dates.
-
-		allDates := make(map[uint64]bool)
-		for _, a := range active {
-			allDates[a.Time] = true
+		err = s.ch.Conn.Select(context.Background(), &newAccs, sqlNewDaily)
+		if err != nil {
+			// Fallback: compute from address_first_seen states (still expensive at large scale).
+			sqlNewFromStates := `
+				SELECT
+					toUnixTimestamp(toStartOfDay(first_seen))*1000 AS datetime,
+					count() AS count
+				FROM (
+					SELECT
+						address_id,
+						minMerge(first_seen_state) AS first_seen
+					FROM address_first_seen
+					GROUP BY address_id
+				)
+				GROUP BY datetime
+				ORDER BY datetime ASC
+			`
+			err = s.ch.Conn.Select(context.Background(), &newAccs, sqlNewFromStates)
+			if err != nil {
+				// Final fallback: original full scan.
+				sqlNewRaw := `
+					SELECT 
+						toUnixTimestamp(toStartOfDay(min_time))*1000 as datetime, 
+						count() as count 
+					FROM (
+						SELECT address_id, min(block_time) as min_time 
+						FROM account_txs 
+						GROUP BY address_id
+					) 
+					GROUP BY datetime 
+					ORDER BY datetime ASC
+				`
+				_ = s.ch.Conn.Select(context.Background(), &newAccs, sqlNewRaw)
+			}
 		}
-		for _, n := range newAccs {
-			allDates[n.Time] = true
-		}
-
-		// Convert to sorted list
-		var dates []uint64
-		for d := range allDates {
-			dates = append(dates, d)
-		}
-		// Sort dates... (omitted, assume we need sort)
-		// Since we can't easily sort in Go without import sort,
-		// and we want to avoid complexity, let's rely on SQL order.
-		// We will just iterate newAccs and lookup active.
-		// This misses days with only active accounts but no new ones.
-		// But FCD usually shows growth.
-
-		// Better: Use newAccs as primary because it defines "Total Accounts".
 
 		newAccMap := make(map[uint64]uint64)
 		for _, n := range newAccs {
 			newAccMap[n.Time] = n.Count
 		}
 
-		// Use active as primary iterator? No.
-		// Let's just use newAccs for now.
-
+		allDates := make(map[uint64]struct{})
+		for _, a := range active {
+			allDates[a.Time] = struct{}{}
+		}
 		for _, n := range newAccs {
-			total += n.Count
-			act := activeMap[n.Time]
-			cumulativeActive += act
+			allDates[n.Time] = struct{}{}
+		}
+		dates := make([]uint64, 0, len(allDates))
+		for d := range allDates {
+			dates = append(dates, d)
+		}
+		sort.Slice(dates, func(i, j int) bool { return dates[i] < dates[j] })
 
-			periodic = append(periodic, Growth{
-				Time:   n.Time,
-				Count:  n.Count, // Periodic total is diff
-				Active: act,
-			})
+		var periodic []Growth
+		var cumulative []Growth
+		var runningTotal uint64
+		var cumulativeActive uint64
 
-			cumulative = append(cumulative, Growth{
-				Time:   n.Time,
-				Count:  total,
-				Active: cumulativeActive,
-			})
+		for _, d := range dates {
+			newCount := newAccMap[d]
+			activeCount := activeMap[d]
+			runningTotal += newCount
+			cumulativeActive += activeCount
+
+			cumulative = append(cumulative, Growth{Time: d, Count: runningTotal, Active: cumulativeActive})
+			periodic = append(periodic, Growth{Time: d, Count: newCount, Active: activeCount})
+		}
+
+		// Match fcd-classic: omit the first data point.
+		if len(periodic) > 0 {
+			periodic = periodic[1:]
+		}
+		if len(cumulative) > 0 {
+			cumulative = cumulative[1:]
 		}
 
 		if periodic == nil {
@@ -618,22 +641,36 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
-	s.respondWithCache(w, "active_accounts", 5*time.Minute, func() (interface{}, error) {
+	s.respondWithCache(w, "active_accounts", 1*time.Hour, func() (interface{}, error) {
 		type Active struct {
 			Time  uint64 `json:"datetime" ch:"datetime"`
 			Count uint64 `json:"value" ch:"value"`
 		}
 
 		var active []Active
-		sql := `
-			SELECT 
-				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
-				uniq(address_id) as value 
-			FROM account_txs 
-			GROUP BY datetime 
-			ORDER BY datetime ASC
+		// Prefer a pre-aggregated table if present. This avoids a full scan over `account_txs`.
+		// See `schema.sql` for the materialized view/table that populate this.
+		sqlAgg := `
+			SELECT
+				toUnixTimestamp(day) * 1000 AS datetime,
+				uniqCombined64Merge(active_state) AS value
+			FROM account_txs_daily_active
+			GROUP BY day
+			ORDER BY day ASC
 		`
-		err := s.ch.Conn.Select(context.Background(), &active, sql)
+		err := s.ch.Conn.Select(context.Background(), &active, sqlAgg)
+		if err != nil {
+			// Fallback to raw scan if the aggregate table doesn't exist (or query fails).
+			sqlRaw := `
+				SELECT
+					toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime,
+					uniq(address_id) as value
+				FROM account_txs
+				GROUP BY datetime
+				ORDER BY datetime ASC
+			`
+			err = s.ch.Conn.Select(context.Background(), &active, sqlRaw)
+		}
 		if err != nil {
 			return map[string]interface{}{
 				"total":    0,
@@ -665,7 +702,7 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
-	s.respondWithCache(w, "registered_accounts", 5*time.Minute, func() (interface{}, error) {
+	s.respondWithCache(w, "registered_accounts", 1*time.Hour, func() (interface{}, error) {
 		var total uint64
 		err := s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
 		if err != nil {
@@ -677,19 +714,49 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 			Count uint64 `json:"value" ch:"value"`
 		}
 		var growth []Growth
-		sql := `
-			SELECT 
-				toUnixTimestamp(toStartOfDay(min_time))*1000 as datetime, 
-				count() as value 
-			FROM (
-				SELECT address_id, min(block_time) as min_time 
-				FROM account_txs 
-				GROUP BY address_id
-			) 
-			GROUP BY datetime 
-			ORDER BY datetime ASC
+		sqlDaily := `
+			SELECT
+				toUnixTimestamp(day) * 1000 AS datetime,
+				sum(value) AS value
+			FROM registered_accounts_daily
+			GROUP BY day
+			ORDER BY day ASC
 		`
-		_ = s.ch.Conn.Select(context.Background(), &growth, sql)
+		err = s.ch.Conn.Select(context.Background(), &growth, sqlDaily)
+		if err != nil {
+			// Fallback: compute from address_first_seen states.
+			sqlFromStates := `
+				SELECT
+					toUnixTimestamp(toStartOfDay(first_seen))*1000 AS datetime,
+					count() AS value
+				FROM (
+					SELECT
+						address_id,
+						minMerge(first_seen_state) AS first_seen
+					FROM address_first_seen
+					GROUP BY address_id
+				)
+				GROUP BY datetime
+				ORDER BY datetime ASC
+			`
+			err = s.ch.Conn.Select(context.Background(), &growth, sqlFromStates)
+			if err != nil {
+				// Final fallback: original full scan.
+				sqlRaw := `
+					SELECT 
+						toUnixTimestamp(toStartOfDay(min_time))*1000 as datetime, 
+						count() as value 
+					FROM (
+						SELECT address_id, min(block_time) as min_time 
+						FROM account_txs 
+						GROUP BY address_id
+					) 
+					GROUP BY datetime 
+					ORDER BY datetime ASC
+				`
+				_ = s.ch.Conn.Select(context.Background(), &growth, sqlRaw)
+			}
+		}
 
 		var cumulative []Growth
 		var runningTotal uint64 = 0
@@ -706,6 +773,14 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		if cumulative == nil {
 			cumulative = []Growth{}
+		}
+
+		// Match fcd-classic: omit the first data point.
+		if len(growth) > 0 {
+			growth = growth[1:]
+		}
+		if len(cumulative) > 0 {
+			cumulative = cumulative[1:]
 		}
 
 		return map[string]interface{}{

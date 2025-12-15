@@ -230,3 +230,88 @@ func mapProtoToAmino(protoName string) string {
 	}
 	return protoName
 }
+
+func compactFCDTxResponse(tx FCDTxResponse, account string) FCDTxResponse {
+	// Mirror fcd-classic `compact` mode:
+	// - Strip irrelevant msgs & logs by address.
+	// - Strip raw_log when the tx is successful.
+	if tx.Code == 0 {
+		tx.RawLog = ""
+	}
+
+	if account == "" {
+		return tx
+	}
+
+	msgIndexes := make(map[int]struct{})
+
+	// Look for address in each message
+	for i, m := range tx.Tx.Value.Msg {
+		if hasValueInAny(m, account) {
+			msgIndexes[i] = struct{}{}
+		}
+	}
+
+	// Look for address in each log (and map back to msg_index)
+	for _, l := range tx.Logs {
+		if hasValueInAny(l, account) {
+			msgIndexes[l.MsgIndex] = struct{}{}
+		}
+	}
+
+	// If we found any, strip to only those.
+	if len(msgIndexes) > 0 {
+		var msgs []interface{}
+		for i, m := range tx.Tx.Value.Msg {
+			if _, ok := msgIndexes[i]; ok {
+				msgs = append(msgs, m)
+			}
+		}
+		tx.Tx.Value.Msg = msgs
+
+		var logs []FCDLog
+		for _, l := range tx.Logs {
+			if _, ok := msgIndexes[l.MsgIndex]; ok {
+				logs = append(logs, l)
+			}
+		}
+		tx.Logs = logs
+	}
+
+	return tx
+}
+
+func hasValueInAny(v interface{}, target string) bool {
+	switch vv := v.(type) {
+	case string:
+		return vv == target
+	case []interface{}:
+		for _, item := range vv {
+			if hasValueInAny(item, target) {
+				return true
+			}
+		}
+		return false
+	case map[string]interface{}:
+		for _, val := range vv {
+			if hasValueInAny(val, target) {
+				return true
+			}
+		}
+		return false
+	default:
+		// Also handle structs we control.
+		if l, ok := v.(FCDLog); ok {
+			if hasValueInAny(l.Log, target) {
+				return true
+			}
+			for _, ev := range l.Events {
+				if hasValueInAny(ev, target) {
+					return true
+				}
+			}
+			return false
+		}
+		return false
+	}
+}

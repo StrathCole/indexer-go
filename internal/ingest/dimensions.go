@@ -47,11 +47,11 @@ func (d *Dimensions) clearAddressCacheIfNeeded() {
 }
 
 
-func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, lastSeenHeight uint64, lastSeenAt time.Time) (uint64, error) {
+func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, lastSeenHeight uint64, lastSeenAt time.Time) (uint64, bool, error) {
 	if v, ok := d.addressCache.Load(address); ok {
 		entry := v.(addressCacheEntry)
 		if lastSeenHeight <= entry.lastSeenHeight {
-			return entry.id, nil
+			return entry.id, false, nil
 		}
 
 		// Update last-seen marker for known addresses, but only when height moves forward.
@@ -66,7 +66,7 @@ func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, l
 			entry.lastSeenHeight = lastSeenHeight
 			d.addressCache.Store(address, entry)
 		}
-		return entry.id, nil
+		return entry.id, false, nil
 	}
 
 	// Check if cache needs cleanup before adding new entries
@@ -74,23 +74,41 @@ func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, l
 
 	var id uint64
 	var storedHeight uint64
+	var inserted bool
 	query := `
-		INSERT INTO addresses (address, type, last_seen_height, last_seen_at)
-		VALUES ($1, 'account', $2, $3)
-		ON CONFLICT (address) DO UPDATE
-		SET last_seen_height = GREATEST(addresses.last_seen_height, EXCLUDED.last_seen_height),
-		    last_seen_at = GREATEST(addresses.last_seen_at, EXCLUDED.last_seen_at)
-		RETURNING id, last_seen_height;
+		WITH ins AS (
+			INSERT INTO addresses (address, type, last_seen_height, last_seen_at)
+			VALUES ($1, 'account', $2, $3)
+			ON CONFLICT (address) DO NOTHING
+			RETURNING id, last_seen_height
+		), upd AS (
+			UPDATE addresses
+			SET last_seen_height = GREATEST(addresses.last_seen_height, $2),
+			    last_seen_at = GREATEST(addresses.last_seen_at, $3)
+			WHERE address = $1
+			  AND NOT EXISTS (SELECT 1 FROM ins)
+			RETURNING id, last_seen_height
+		)
+		SELECT
+			id,
+			last_seen_height,
+			(SELECT count() > 0 FROM ins) AS inserted
+		FROM (
+			SELECT id, last_seen_height FROM ins
+			UNION ALL
+			SELECT id, last_seen_height FROM upd
+			LIMIT 1
+		) t;
 	`
 
-	err := d.pg.Pool.QueryRow(ctx, query, address, lastSeenHeight, lastSeenAt).Scan(&id, &storedHeight)
+	err := d.pg.Pool.QueryRow(ctx, query, address, lastSeenHeight, lastSeenAt).Scan(&id, &storedHeight, &inserted)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get or create address id: %w", err)
+		return 0, false, fmt.Errorf("failed to get or create address id: %w", err)
 	}
 
 	d.addressCache.Store(address, addressCacheEntry{id: id, lastSeenHeight: storedHeight})
 	atomic.AddInt64(&d.addressCacheSize, 1)
-	return id, nil
+	return id, inserted, nil
 }
 
 func (d *Dimensions) GetOrCreateDenomID(ctx context.Context, denom string) (uint16, error) {

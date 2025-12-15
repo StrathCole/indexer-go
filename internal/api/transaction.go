@@ -25,6 +25,8 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 	block := queryParams.Get("block")
 	limitStr := queryParams.Get("limit")
 	offsetStr := queryParams.Get("offset")
+	compactStr := strings.TrimSpace(queryParams.Get("compact"))
+	compact := compactStr == "true" || compactStr == "1"
 
 	limit := 10
 	if limitStr != "" {
@@ -155,7 +157,11 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 				// Transaction - use FCD format
 				key := fmt.Sprintf("%d-%d", at.Height, at.IndexInBlock)
 				if tx, ok := txMap[key]; ok {
-					responses = append(responses, s.MapTxToFCD(tx, denoms, msgTypes))
+					mapped := s.MapTxToFCD(tx, denoms, msgTypes)
+					if compact {
+						mapped = compactFCDTxResponse(mapped, account)
+					}
+					responses = append(responses, mapped)
 				}
 			}
 		}

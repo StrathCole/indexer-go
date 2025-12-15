@@ -72,12 +72,12 @@ func (s *Service) convertTx(
 	txHash string,
 	tx sdk.Tx,
 	txRes *coretypes.ResultBlockResults,
-) (*model.Tx, []model.Event, []model.AccountTx, error) {
+) (*model.Tx, []model.Event, []model.AccountTx, uint64, error) {
 	// txRes contains DeliverTx results which has gas used, logs, events etc.
 
 	// We need to match the index with the result in txRes.TxsResults
 	if int(index) >= len(txRes.TxsResults) {
-		return nil, nil, nil, fmt.Errorf("tx index out of bounds")
+		return nil, nil, nil, 0, fmt.Errorf("tx index out of bounds")
 	}
 	res := txRes.TxsResults[index]
 
@@ -225,12 +225,12 @@ func (s *Service) convertTx(
 	}
 
 	// Extract AccountTxs
-	accountTxs, err := s.extractAccountTxs(context.Background(), height, index, blockTime, txHashRaw, res.Events)
+	accountTxs, newAccounts, err := s.extractAccountTxs(context.Background(), height, index, blockTime, txHashRaw, res.Events)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to extract account txs: %w", err)
+		return nil, nil, nil, 0, fmt.Errorf("failed to extract account txs: %w", err)
 	}
 
-	return modelTx, events, accountTxs, nil
+	return modelTx, events, accountTxs, newAccounts, nil
 }
 
 // isTerraAddress checks if a string is a valid Terra address (terra1... bech32)
@@ -304,8 +304,9 @@ func (s *Service) extractAccountTxs(
 	blockTime time.Time,
 	txHash string,
 	events []abcitypes.Event,
-) ([]model.AccountTx, error) {
+) ([]model.AccountTx, uint64, error) {
 	accountTxsMap := make(map[uint64]*model.AccountTx)
+	var newAccounts uint64
 
 	// First, extract main amount from transfer events for context
 	var mainAmount sdk.Coins
@@ -331,9 +332,12 @@ func (s *Service) extractAccountTxs(
 
 	// Create AccountTx entries for each unique address
 	for address, direction := range addressDirections {
-		addressID, err := s.dims.GetOrCreateAddressID(ctx, address, height, blockTime)
+		addressID, inserted, err := s.dims.GetOrCreateAddressID(ctx, address, height, blockTime)
 		if err != nil {
 			continue
+		}
+		if inserted {
+			newAccounts++
 		}
 		s.addAccountTx(ctx, accountTxsMap, addressID, height, index, blockTime, txHash, direction, mainAmount)
 	}
@@ -343,7 +347,7 @@ func (s *Service) extractAccountTxs(
 		accountTxs = append(accountTxs, *atx)
 	}
 
-	return accountTxs, nil
+	return accountTxs, newAccounts, nil
 }
 
 func (s *Service) addAccountTx(
@@ -398,7 +402,7 @@ func (s *Service) extractAccountBlockEvents(
 	blockTime time.Time,
 	scope string,
 	events []abcitypes.Event,
-) ([]model.AccountTx, error) {
+) ([]model.AccountTx, uint64, error) {
 	// Track address -> (direction, amount) for each address found
 	type addressInfo struct {
 		direction int8
@@ -416,6 +420,7 @@ func (s *Service) extractAccountBlockEvents(
 	}
 
 	// Extract addresses and amounts from all events
+	var newAccounts uint64
 	for _, event := range events {
 		var eventAmount sdk.Coins
 
@@ -440,9 +445,12 @@ func (s *Service) extractAccountBlockEvents(
 				continue
 			}
 
-			addressID, err := s.dims.GetOrCreateAddressID(ctx, value, height, blockTime)
+			addressID, inserted, err := s.dims.GetOrCreateAddressID(ctx, value, height, blockTime)
 			if err != nil {
 				continue
+			}
+			if inserted {
+				newAccounts++
 			}
 
 			// Determine direction based on attribute key
@@ -512,7 +520,7 @@ func (s *Service) extractAccountBlockEvents(
 		})
 	}
 
-	return accountTxs, nil
+	return accountTxs, newAccounts, nil
 }
 
 func (s *Service) convertBlockEvents(

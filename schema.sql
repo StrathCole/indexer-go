@@ -107,3 +107,51 @@ CREATE TABLE IF NOT EXISTS block_rewards (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
 ORDER BY (block_time);
+
+-- Dashboard pre-aggregations
+-- Daily unique active accounts (used by /v1/dashboard/active_accounts).
+-- NOTE: For existing deployments, this will only populate for new inserts unless you backfill.
+CREATE TABLE IF NOT EXISTS account_txs_daily_active (
+    day Date,
+    active_state AggregateFunction(uniqCombined64, UInt64)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(day)
+ORDER BY (day);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_account_txs_daily_active
+TO account_txs_daily_active
+AS
+SELECT
+    toDate(block_time) AS day,
+    uniqCombined64State(address_id) AS active_state
+FROM account_txs
+GROUP BY day;
+
+-- First seen timestamp per address_id (used for /v1/dashboard/registered_accounts and /v1/dashboard/account_growth).
+-- This keeps one aggregated state per address and can be merged incrementally.
+CREATE TABLE IF NOT EXISTS address_first_seen (
+    address_id UInt64,
+    first_seen_state AggregateFunction(min, DateTime64(3))
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (address_id);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_address_first_seen
+TO address_first_seen
+AS
+SELECT
+    address_id,
+    minState(block_time) AS first_seen_state
+FROM account_txs
+GROUP BY address_id;
+
+-- Optional derived table: daily new accounts (fast dashboard queries).
+-- This is intended to be backfilled/rebuilt by a tool or job, not incrementally updated by MV.
+CREATE TABLE IF NOT EXISTS registered_accounts_daily (
+    day Date,
+    value UInt64
+)
+ENGINE = SummingMergeTree
+PARTITION BY toYYYYMM(day)
+ORDER BY (day);
