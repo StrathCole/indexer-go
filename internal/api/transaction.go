@@ -425,6 +425,10 @@ func (s *Server) getValidatorMap(ctx context.Context) (map[string]map[string]str
 }
 
 func (s *Server) GetBlockLatest(w http.ResponseWriter, r *http.Request) {
+	queryParams := r.URL.Query()
+	includeEventsStr := strings.TrimSpace(queryParams.Get("events"))
+	includeEvents := includeEventsStr == "true" || includeEventsStr == "1"
+
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
@@ -434,7 +438,7 @@ func (s *Server) GetBlockLatest(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get latest block: %v", err))
 		return
 	}
-	s.respondBlock(ctx, w, block)
+	s.respondBlock(ctx, w, block, includeEvents)
 }
 
 func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
@@ -446,6 +450,10 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	queryParams := r.URL.Query()
+	includeEventsStr := strings.TrimSpace(queryParams.Get("events"))
+	includeEvents := includeEventsStr == "true" || includeEventsStr == "1"
+
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
@@ -455,7 +463,7 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "Block not found")
 		return
 	}
-	s.respondBlock(ctx, w, block)
+	s.respondBlock(ctx, w, block, includeEvents)
 }
 
 // GetBlockEvents returns block events for a specific height, optionally filtered by account
@@ -571,7 +579,7 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block model.Block) {
+func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block model.Block, includeEvents bool) {
 	start := time.Now()
 	logCtx := log.With().Uint64("height", block.Height).Logger()
 
@@ -610,27 +618,29 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 		}
 	}()
 
-	// 2) Block events (begin/end)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		eventsStart := time.Now()
-		ctxEvents, cancelEvents := context.WithTimeout(ctx, 20*time.Second)
-		defer cancelEvents()
-		sqlEvents := `
-			SELECT *
-			FROM events
-			PREWHERE height = ? AND scope != 'tx' AND toYYYYMM(block_time) = toYYYYMM(?)
-			ORDER BY scope ASC, event_index ASC
-			SETTINGS max_execution_time=10
-		`
-		if err := s.ch.Conn.Select(ctxEvents, &dbEvents, sqlEvents, block.Height, block.BlockTime); err != nil {
-			dbEvents = nil
-		}
-		if d := time.Since(eventsStart); d > 200*time.Millisecond {
-			logCtx.Info().Dur("events_query", d).Msg("Slow block events query")
-		}
-	}()
+	// 2) Block events (begin/end) - only when requested
+	if includeEvents {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eventsStart := time.Now()
+			ctxEvents, cancelEvents := context.WithTimeout(ctx, 20*time.Second)
+			defer cancelEvents()
+			sqlEvents := `
+				SELECT *
+				FROM events
+				PREWHERE height = ? AND scope != 'tx' AND toYYYYMM(block_time) = toYYYYMM(?)
+				ORDER BY scope ASC, event_index ASC
+				SETTINGS max_execution_time=10
+			`
+			if err := s.ch.Conn.Select(ctxEvents, &dbEvents, sqlEvents, block.Height, block.BlockTime); err != nil {
+				dbEvents = nil
+			}
+			if d := time.Since(eventsStart); d > 200*time.Millisecond {
+				logCtx.Info().Dur("events_query", d).Msg("Slow block events query")
+			}
+		}()
+	}
 
 	// 3) Denoms (PG, usually cached)
 	wg.Add(1)
@@ -710,7 +720,7 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 
 	// Fetch Block Events (BeginBlock and EndBlock only)
 	var blockEvents []map[string]interface{}
-	if len(dbEvents) > 0 {
+	if includeEvents && len(dbEvents) > 0 {
 		// Group by (Scope, TxIndex, EventIndex)
 		var currentEvent map[string]interface{}
 		var currentAttrs []map[string]string
@@ -759,7 +769,7 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 			blockEvents = append(blockEvents, currentEvent)
 		}
 	} else {
-		blockEvents = []map[string]interface{}{}
+		blockEvents = nil
 	}
 
 	response := map[string]interface{}{
@@ -768,7 +778,12 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 		"timestamp": block.BlockTime.UTC().Format("2006-01-02T15:04:05.000Z"),
 		"proposer":  proposer,
 		"txs":       fcdTxs,
-		"events":    blockEvents,
+	}
+	if includeEvents {
+		if blockEvents == nil {
+			blockEvents = []map[string]interface{}{}
+		}
+		response["events"] = blockEvents
 	}
 
 	if d := time.Since(start); d > 5*time.Second {
