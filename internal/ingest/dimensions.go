@@ -92,7 +92,7 @@ func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, l
 		SELECT
 			id,
 			last_seen_height,
-			(SELECT count() > 0 FROM ins) AS inserted
+			(SELECT count(*) > 0 FROM ins) AS inserted
 		FROM (
 			SELECT id, last_seen_height FROM ins
 			UNION ALL

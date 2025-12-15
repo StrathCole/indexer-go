@@ -515,7 +515,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 			SELECT
 				toUnixTimestamp(day) * 1000 AS datetime,
 				uniqCombined64Merge(active_state) AS count
-			FROM account_txs_daily_active
+			FROM account_txs_daily_active_tx
 			GROUP BY day
 			ORDER BY day ASC
 		`
@@ -525,7 +525,8 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 				SELECT 
 					toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
 					uniq(address_id) as count 
-				FROM account_txs 
+				FROM account_txs
+				WHERE is_block_event = 0
 				GROUP BY datetime 
 				ORDER BY datetime ASC
 			`
@@ -654,7 +655,7 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 			SELECT
 				toUnixTimestamp(day) * 1000 AS datetime,
 				uniqCombined64Merge(active_state) AS value
-			FROM account_txs_daily_active
+			FROM account_txs_daily_active_tx
 			GROUP BY day
 			ORDER BY day ASC
 		`
@@ -666,6 +667,7 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 					toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime,
 					uniq(address_id) as value
 				FROM account_txs
+				WHERE is_block_event = 0
 				GROUP BY datetime
 				ORDER BY datetime ASC
 			`

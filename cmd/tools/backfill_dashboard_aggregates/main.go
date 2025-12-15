@@ -13,7 +13,7 @@ import (
 
 const (
 	createDailyActiveTable = `
-CREATE TABLE IF NOT EXISTS account_txs_daily_active (
+CREATE TABLE IF NOT EXISTS account_txs_daily_active_tx (
     day Date,
     active_state AggregateFunction(uniqCombined64, UInt64)
 )
@@ -22,13 +22,14 @@ PARTITION BY toYYYYMM(day)
 ORDER BY (day);
 `
 	createDailyActiveMV = `
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_account_txs_daily_active
-TO account_txs_daily_active
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_account_txs_daily_active_tx
+TO account_txs_daily_active_tx
 AS
 SELECT
     toDate(block_time) AS day,
     uniqCombined64State(address_id) AS active_state
 FROM account_txs
+WHERE is_block_event = 0
 GROUP BY day;
 `
 	createFirstSeenTable = `
@@ -170,7 +171,7 @@ func main() {
 
 	log.Printf("Backfilling aggregates from account_txs partitions %d..%d", startYM.int(), endYM.int())
 
-	insertDailyActive := "INSERT INTO account_txs_daily_active SELECT toDate(block_time) AS day, uniqCombined64State(address_id) AS active_state FROM account_txs WHERE toYYYYMM(block_time) = ? GROUP BY day"
+	insertDailyActive := "INSERT INTO account_txs_daily_active_tx SELECT toDate(block_time) AS day, uniqCombined64State(address_id) AS active_state FROM account_txs WHERE is_block_event = 0 AND toYYYYMM(block_time) = ? GROUP BY day"
 	insertFirstSeen := "INSERT INTO address_first_seen SELECT address_id, minState(block_time) AS first_seen_state FROM account_txs WHERE toYYYYMM(block_time) = ? GROUP BY address_id"
 
 	for ym := startYM; ym.int() <= endYM.int(); ym = ym.next() {
@@ -178,7 +179,7 @@ func main() {
 		startTime := time.Now()
 		log.Printf("Partition %d: backfilling daily active...", part)
 		if err := ch.Conn.Exec(ctx, insertDailyActive, part); err != nil {
-			log.Fatalf("Partition %d: failed to backfill account_txs_daily_active: %v", part, err)
+			log.Fatalf("Partition %d: failed to backfill account_txs_daily_active_tx: %v", part, err)
 		}
 
 		log.Printf("Partition %d: backfilling address first-seen...", part)
@@ -191,8 +192,8 @@ func main() {
 
 	if *optimize {
 		log.Printf("Optimizing aggregate tables (FINAL)...")
-		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE account_txs_daily_active FINAL"); err != nil {
-			log.Fatalf("Failed to optimize account_txs_daily_active: %v", err)
+		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE account_txs_daily_active_tx FINAL"); err != nil {
+			log.Fatalf("Failed to optimize account_txs_daily_active_tx: %v", err)
 		}
 		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE address_first_seen FINAL"); err != nil {
 			log.Fatalf("Failed to optimize address_first_seen: %v", err)

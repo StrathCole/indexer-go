@@ -109,9 +109,11 @@ PARTITION BY toYYYYMM(block_time)
 ORDER BY (block_time);
 
 -- Dashboard pre-aggregations
--- Daily unique active accounts (used by /v1/dashboard/active_accounts).
+-- Daily unique active accounts from transactions only (used by /v1/dashboard/active_accounts).
+-- This intentionally excludes begin_block/end_block derived rows in account_txs (is_block_event=1),
+-- which can touch large numbers of accounts and would inflate “active accounts” beyond fcd-classic semantics.
 -- NOTE: For existing deployments, this will only populate for new inserts unless you backfill.
-CREATE TABLE IF NOT EXISTS account_txs_daily_active (
+CREATE TABLE IF NOT EXISTS account_txs_daily_active_tx (
     day Date,
     active_state AggregateFunction(uniqCombined64, UInt64)
 )
@@ -119,13 +121,14 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(day)
 ORDER BY (day);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_account_txs_daily_active
-TO account_txs_daily_active
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_account_txs_daily_active_tx
+TO account_txs_daily_active_tx
 AS
 SELECT
     toDate(block_time) AS day,
     uniqCombined64State(address_id) AS active_state
 FROM account_txs
+WHERE is_block_event = 0
 GROUP BY day;
 
 -- First seen timestamp per address_id (used for /v1/dashboard/registered_accounts and /v1/dashboard/account_growth).
