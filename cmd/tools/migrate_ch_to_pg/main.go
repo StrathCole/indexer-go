@@ -252,7 +252,15 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	}
 	log.Printf("  Height range: %d - %d", minHeight, maxHeight)
 
-	// Step 1: Truncate and drop all indexes/constraints for maximum write speed.
+	// Step 1: Terminate backends that might block DDL, then truncate and drop indexes.
+	log.Println("  Terminating other backends using account_txs...")
+	_, _ = pg.Pool.Exec(ctx,
+		`SELECT pg_terminate_backend(pid)
+		 FROM pg_stat_activity
+		 WHERE pid <> pg_backend_pid()
+		   AND datname = current_database()
+		   AND state <> 'idle'`)
+
 	log.Println("  Truncating account_txs and dropping indexes...")
 	ddl := []string{
 		"TRUNCATE account_txs",
@@ -352,10 +360,17 @@ func copyAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 	pg *db.Postgres, cols []string, lo, hi uint64) (int64, error) {
 
 	rows, err := ch.Conn.Query(ctx,
-		"SELECT address_id, height, index_in_block, block_time, tx_hash, "+
-			"direction, main_denom_id, main_amount, is_block_event, event_scope "+
-			"FROM account_txs WHERE height >= $1 AND height <= $2 "+
-			"ORDER BY height, index_in_block",
+		"SELECT address_id, height, index_in_block, "+
+			"any(block_time) AS block_time, "+
+			"any(tx_hash) AS tx_hash, "+
+			"any(direction) AS direction, "+
+			"any(main_denom_id) AS main_denom_id, "+
+			"any(main_amount) AS main_amount, "+
+			"is_block_event, "+
+			"any(event_scope) AS event_scope "+
+			"FROM account_txs "+
+			"WHERE height >= $1 AND height <= $2 "+
+			"GROUP BY address_id, height, index_in_block, is_block_event",
 		lo, hi)
 	if err != nil {
 		return 0, fmt.Errorf("query CH [%d..%d]: %w", lo, hi, err)
