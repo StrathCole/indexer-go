@@ -12,6 +12,7 @@ import (
 
 	"github.com/classic-terra/indexer-go/internal/config"
 	"github.com/classic-terra/indexer-go/internal/db"
+	"github.com/jackc/pgx/v5"
 )
 
 // stripNull removes \x00 padding from ClickHouse FixedString values.
@@ -272,7 +273,7 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	}
 
 	// Process by height ranges to keep memory bounded.
-	const workers = 4
+	const workers = 8
 	type chunk struct {
 		lo, hi uint64
 	}
@@ -331,8 +332,8 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	return nil
 }
 
-// migrateAccountTxsChunk reads a height range from CH and writes to PG.
-// Returns the number of rows migrated.
+// migrateAccountTxsChunk reads a height range from CH and writes to PG
+// using COPY into a temp table + merge for maximum throughput.
 func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 	pg *db.Postgres, lo, hi uint64) (int64, error) {
 
@@ -346,8 +347,8 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 		return 0, fmt.Errorf("query CH account_txs [%d..%d]: %w", lo, hi, err)
 	}
 
-	var batch []db.PgAccountTx
-	var count int64
+	// Collect all rows from this chunk
+	var allRows [][]interface{}
 	for rows.Next() {
 		var t db.PgAccountTx
 		if err := rows.Scan(
@@ -359,27 +360,64 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 			return 0, fmt.Errorf("scan account_tx: %w", err)
 		}
 		t.TxHash = stripNull(t.TxHash)
-		batch = append(batch, t)
-
-		// Flush in sub-batches to keep PG batch size reasonable
-		if len(batch) >= 5000 {
-			if err := pg.InsertAccountTxs(ctx, batch); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("insert account_txs: %w", err)
-			}
-			count += int64(len(batch))
-			batch = batch[:0]
-		}
+		allRows = append(allRows, []interface{}{
+			t.AddressID, t.Height, t.IndexInBlock, t.BlockTime, t.TxHash,
+			t.Direction, t.MainDenomID, t.MainAmount, t.IsBlockEvent, t.EventScope,
+		})
 	}
 	rows.Close()
 
-	// Flush remainder
-	if len(batch) > 0 {
-		if err := pg.InsertAccountTxs(ctx, batch); err != nil {
-			return 0, fmt.Errorf("insert account_txs remainder: %w", err)
-		}
-		count += int64(len(batch))
+	if len(allRows) == 0 {
+		return 0, nil
 	}
 
-	return count, nil
+	// Use COPY into temp table then merge — much faster than individual INSERTs.
+	conn, err := pg.Pool.Acquire(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("acquire pg conn: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Create temp table (inherits structure, no constraints)
+	tempName := fmt.Sprintf("_tmp_acctx_%d", lo)
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		"CREATE TEMP TABLE %s (LIKE account_txs INCLUDING NOTHING) ON COMMIT DROP", tempName))
+	if err != nil {
+		return 0, fmt.Errorf("create temp table: %w", err)
+	}
+
+	// COPY into temp table (no constraints = fast)
+	cols := []string{"address_id", "height", "index_in_block", "block_time", "tx_hash",
+		"direction", "main_denom_id", "main_amount", "is_block_event", "event_scope"}
+
+	_, err = tx.CopyFrom(ctx,
+		pgx.Identifier{tempName},
+		cols,
+		pgx.CopyFromRows(allRows),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("COPY into temp: %w", err)
+	}
+
+	// Merge into real table
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO account_txs (%s)
+		 SELECT %s FROM %s
+		 ON CONFLICT (address_id, height, index_in_block, is_block_event) DO NOTHING`,
+		strings.Join(cols, ","), strings.Join(cols, ","), tempName))
+	if err != nil {
+		return 0, fmt.Errorf("merge from temp: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+
+	return int64(len(allRows)), nil
 }
