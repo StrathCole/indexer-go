@@ -14,6 +14,11 @@ import (
 	"github.com/classic-terra/indexer-go/internal/db"
 )
 
+// stripNull removes \x00 padding from ClickHouse FixedString values.
+func stripNull(s string) string {
+	return strings.TrimRight(s, "\x00")
+}
+
 func main() {
 	configPath := flag.String("config", ".", "Path to config directory")
 	tables := flag.String("tables", "blocks,oracle_prices,account_txs",
@@ -112,6 +117,7 @@ func migrateBlocks(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batc
 				rows.Close()
 				return fmt.Errorf("scan block: %w", err)
 			}
+			b.BlockHash = stripNull(b.BlockHash)
 			batch = append(batch, b)
 			if int64(b.Height) > maxInBatch {
 				maxInBatch = int64(b.Height)
@@ -352,6 +358,7 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 			rows.Close()
 			return 0, fmt.Errorf("scan account_tx: %w", err)
 		}
+		t.TxHash = stripNull(t.TxHash)
 		batch = append(batch, t)
 
 		// Flush in sub-batches to keep PG batch size reasonable
