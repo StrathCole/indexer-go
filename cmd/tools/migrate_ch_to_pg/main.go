@@ -384,10 +384,15 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 	}
 	defer tx.Rollback(ctx)
 
-	// Create temp table (inherits structure, no constraints)
+	// Create temp table (same columns, no constraints = fast COPY)
 	tempName := fmt.Sprintf("_tmp_acctx_%d", lo)
 	_, err = tx.Exec(ctx, fmt.Sprintf(
-		"CREATE TEMP TABLE %s (LIKE account_txs INCLUDING NOTHING) ON COMMIT DROP", tempName))
+		`CREATE TEMP TABLE %s (
+			address_id BIGINT, height BIGINT, index_in_block SMALLINT,
+			block_time TIMESTAMPTZ, tx_hash CHAR(64), direction SMALLINT,
+			main_denom_id SMALLINT, main_amount BIGINT,
+			is_block_event BOOLEAN, event_scope SMALLINT
+		) ON COMMIT DROP`, tempName))
 	if err != nil {
 		return 0, fmt.Errorf("create temp table: %w", err)
 	}
