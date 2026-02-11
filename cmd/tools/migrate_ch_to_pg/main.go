@@ -229,7 +229,7 @@ func migrateOraclePrices(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres
 }
 
 // ---------------------------------------------------------------------------
-// account_txs  (largest table — uses parallel height-range workers)
+// account_txs  (largest table — bulk COPY with indexes dropped)
 // ---------------------------------------------------------------------------
 
 func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batchSize int) error {
@@ -241,7 +241,6 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	}
 	log.Printf("  ClickHouse account_txs: %d", totalCH)
 
-	// Find height range in CH
 	var minHeight, maxHeight uint64
 	if err := ch.Conn.QueryRow(ctx,
 		"SELECT min(height), max(height) FROM account_txs").Scan(&minHeight, &maxHeight); err != nil {
@@ -253,35 +252,29 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	}
 	log.Printf("  Height range: %d - %d", minHeight, maxHeight)
 
-	// Resume: find last fully migrated height range
-	var pgMaxHeight uint64
-	err := pg.Pool.QueryRow(ctx,
-		"SELECT COALESCE(max(height), 0) FROM account_txs").Scan(&pgMaxHeight)
-	if err != nil {
-		return fmt.Errorf("pg max account_txs height: %w", err)
+	// Step 1: Truncate and drop all indexes/constraints for maximum write speed.
+	log.Println("  Truncating account_txs and dropping indexes...")
+	ddl := []string{
+		"TRUNCATE account_txs",
+		"ALTER TABLE account_txs DROP CONSTRAINT IF EXISTS account_txs_pkey",
+		"DROP INDEX IF EXISTS idx_account_txs_addr_height",
+		"DROP INDEX IF EXISTS idx_account_txs_time",
+		"DROP INDEX IF EXISTS idx_account_txs_hash",
 	}
-
-	startFrom := minHeight
-	if pgMaxHeight > 0 {
-		// Re-process from the start of the chunk that contained pgMaxHeight.
-		// ON CONFLICT DO NOTHING makes re-processing safe.
-		chunkStart := (pgMaxHeight / uint64(batchSize)) * uint64(batchSize)
-		if chunkStart > minHeight {
-			startFrom = chunkStart
+	for _, stmt := range ddl {
+		if _, err := pg.Pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("DDL %q: %w", stmt, err)
 		}
-		log.Printf("  Resuming from height >= %d (PG max: %d)", startFrom, pgMaxHeight)
 	}
+	log.Println("  Indexes dropped. Starting bulk COPY...")
 
-	// Process by height ranges to keep memory bounded.
+	// Step 2: Stream data with parallel workers using direct COPY (no temp table, no conflict check).
 	const workers = 8
-	type chunk struct {
-		lo, hi uint64
-	}
+	type chunk struct{ lo, hi uint64 }
 	chunks := make(chan chunk, workers*2)
 
-	// Producer: generate height-range chunks
 	go func() {
-		for lo := startFrom; lo <= maxHeight; lo += uint64(batchSize) {
+		for lo := minHeight; lo <= maxHeight; lo += uint64(batchSize) {
 			hi := lo + uint64(batchSize) - 1
 			if hi > maxHeight {
 				hi = maxHeight
@@ -295,10 +288,13 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 	startTime := time.Now()
 	errChan := make(chan error, workers)
 
+	cols := []string{"address_id", "height", "index_in_block", "block_time", "tx_hash",
+		"direction", "main_denom_id", "main_amount", "is_block_event", "event_scope"}
+
 	for w := 0; w < workers; w++ {
 		go func() {
 			for c := range chunks {
-				n, err := migrateAccountTxsChunk(ctx, ch, pg, c.lo, c.hi)
+				n, err := copyAccountTxsChunk(ctx, ch, pg, cols, c.lo, c.hi)
 				if err != nil {
 					errChan <- err
 					return
@@ -319,23 +315,41 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 		}()
 	}
 
-	// Wait for all workers
 	for w := 0; w < workers; w++ {
 		if e := <-errChan; e != nil {
 			return e
 		}
 	}
-
 	fmt.Fprintln(os.Stderr)
+
+	total := globalMigrated.Load()
+	log.Printf("  COPY complete: %d rows in %s", total, time.Since(startTime).Truncate(time.Second))
+
+	// Step 3: Recreate primary key and indexes.
+	log.Println("  Recreating primary key and indexes (this may take a while)...")
+	idxStart := time.Now()
+	rebuild := []string{
+		"ALTER TABLE account_txs ADD PRIMARY KEY (address_id, height, index_in_block, is_block_event)",
+		"CREATE INDEX idx_account_txs_addr_height ON account_txs(address_id, height DESC, index_in_block DESC)",
+		"CREATE INDEX idx_account_txs_time ON account_txs(block_time)",
+		"CREATE INDEX idx_account_txs_hash ON account_txs(tx_hash)",
+	}
+	for _, stmt := range rebuild {
+		log.Printf("    %s", stmt)
+		if _, err := pg.Pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("rebuild %q: %w", stmt, err)
+		}
+	}
+	log.Printf("  Indexes rebuilt in %s", time.Since(idxStart).Truncate(time.Second))
+
 	log.Printf("  account_txs done: %d rows migrated in %s",
-		globalMigrated.Load(), time.Since(startTime).Truncate(time.Second))
+		total, time.Since(startTime).Truncate(time.Second))
 	return nil
 }
 
-// migrateAccountTxsChunk reads a height range from CH and writes to PG
-// using COPY into a temp table + merge for maximum throughput.
-func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
-	pg *db.Postgres, lo, hi uint64) (int64, error) {
+// copyAccountTxsChunk reads a height range from CH and COPY's directly into PG.
+func copyAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
+	pg *db.Postgres, cols []string, lo, hi uint64) (int64, error) {
 
 	rows, err := ch.Conn.Query(ctx,
 		"SELECT address_id, height, index_in_block, block_time, tx_hash, "+
@@ -344,10 +358,9 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 			"ORDER BY height, index_in_block",
 		lo, hi)
 	if err != nil {
-		return 0, fmt.Errorf("query CH account_txs [%d..%d]: %w", lo, hi, err)
+		return 0, fmt.Errorf("query CH [%d..%d]: %w", lo, hi, err)
 	}
 
-	// Collect all rows from this chunk
 	var allRows [][]interface{}
 	for rows.Next() {
 		var t db.PgAccountTx
@@ -357,7 +370,7 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 			&t.EventScope,
 		); err != nil {
 			rows.Close()
-			return 0, fmt.Errorf("scan account_tx: %w", err)
+			return 0, fmt.Errorf("scan: %w", err)
 		}
 		t.TxHash = stripNull(t.TxHash)
 		allRows = append(allRows, []interface{}{
@@ -371,57 +384,19 @@ func migrateAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 		return 0, nil
 	}
 
-	// Use COPY into temp table then merge — much faster than individual INSERTs.
 	conn, err := pg.Pool.Acquire(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("acquire pg conn: %w", err)
+		return 0, fmt.Errorf("acquire conn: %w", err)
 	}
 	defer conn.Release()
 
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Create temp table (same columns, no constraints = fast COPY)
-	tempName := fmt.Sprintf("_tmp_acctx_%d", lo)
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		`CREATE TEMP TABLE %s (
-			address_id BIGINT, height BIGINT, index_in_block SMALLINT,
-			block_time TIMESTAMPTZ, tx_hash CHAR(64), direction SMALLINT,
-			main_denom_id SMALLINT, main_amount BIGINT,
-			is_block_event BOOLEAN, event_scope SMALLINT
-		) ON COMMIT DROP`, tempName))
-	if err != nil {
-		return 0, fmt.Errorf("create temp table: %w", err)
-	}
-
-	// COPY into temp table (no constraints = fast)
-	cols := []string{"address_id", "height", "index_in_block", "block_time", "tx_hash",
-		"direction", "main_denom_id", "main_amount", "is_block_event", "event_scope"}
-
-	_, err = tx.CopyFrom(ctx,
-		pgx.Identifier{tempName},
+	_, err = conn.CopyFrom(ctx,
+		pgx.Identifier{"account_txs"},
 		cols,
 		pgx.CopyFromRows(allRows),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("COPY into temp: %w", err)
-	}
-
-	// Merge into real table
-	_, err = tx.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO account_txs (%s)
-		 SELECT %s FROM %s
-		 ON CONFLICT (address_id, height, index_in_block, is_block_event) DO NOTHING`,
-		strings.Join(cols, ","), strings.Join(cols, ","), tempName))
-	if err != nil {
-		return 0, fmt.Errorf("merge from temp: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit: %w", err)
+		return 0, fmt.Errorf("COPY [%d..%d]: %w", lo, hi, err)
 	}
 
 	return int64(len(allRows)), nil
