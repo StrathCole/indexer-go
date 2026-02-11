@@ -72,32 +72,28 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Query account_txs to get all activity (both txs and block events)
-		var args []interface{}
-		whereClause := "address_id = ?"
-		args = append(args, addressID)
-
-		if offset > 0 {
-			height := offset / 100000
-			index := offset % 100000
-			whereClause += " AND (height < ? OR (height = ? AND index_in_block < ?))"
-			args = append(args, height, height, index)
-		}
-
-		sql := fmt.Sprintf(`
-			SELECT address_id, height, index_in_block, block_time, tx_hash, direction, main_denom_id, main_amount, is_block_event, event_scope
-			FROM account_txs
-			WHERE %s
-			ORDER BY height DESC, index_in_block DESC
-			LIMIT ?
-		`, whereClause)
-		args = append(args, limit)
-
-		var accountTxs []model.AccountTx
-		err = s.ch.Conn.Select(context.Background(), &accountTxs, sql, args...)
+		// Query account_txs from PostgreSQL for fast account-history lookups
+		pgAccountTxs, err := s.pg.GetAccountActivity(context.Background(), addressID, offset, limit)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch activity: %v", err))
 			return
+		}
+
+		// Convert to model.AccountTx for downstream processing
+		accountTxs := make([]model.AccountTx, len(pgAccountTxs))
+		for i, pat := range pgAccountTxs {
+			accountTxs[i] = model.AccountTx{
+				AddressID:    pat.AddressID,
+				Height:       pat.Height,
+				IndexInBlock: pat.IndexInBlock,
+				BlockTime:    pat.BlockTime,
+				TxHash:       strings.TrimSpace(pat.TxHash),
+				Direction:    pat.Direction,
+				MainDenomID:  pat.MainDenomID,
+				MainAmount:   pat.MainAmount,
+				IsBlockEvent: pat.IsBlockEvent,
+				EventScope:   pat.EventScope,
+			}
 		}
 
 		// Separate into tx entries and block event entries
@@ -432,11 +428,17 @@ func (s *Server) GetBlockLatest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	var block model.Block
-	err := s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks ORDER BY height DESC LIMIT 1 SETTINGS max_execution_time=10").ScanStruct(&block)
+	pgBlock, err := s.pg.GetLatestBlock(ctx)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to get latest block: %v", err))
 		return
+	}
+	block := model.Block{
+		Height:          pgBlock.Height,
+		BlockHash:       pgBlock.BlockHash,
+		BlockTime:       pgBlock.BlockTime,
+		ProposerAddress: pgBlock.ProposerAddress,
+		TxCount:         pgBlock.TxCount,
 	}
 	s.respondBlock(ctx, w, block, includeEvents)
 }
@@ -457,11 +459,17 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	var block model.Block
-	err = s.ch.Conn.QueryRow(ctx, "SELECT * FROM blocks PREWHERE height = ? LIMIT 1 SETTINGS max_execution_time=10", height).ScanStruct(&block)
+	pgBlock, err := s.pg.GetBlock(ctx, height)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "Block not found")
 		return
+	}
+	block := model.Block{
+		Height:          pgBlock.Height,
+		BlockHash:       pgBlock.BlockHash,
+		BlockTime:       pgBlock.BlockTime,
+		ProposerAddress: pgBlock.ProposerAddress,
+		TxCount:         pgBlock.TxCount,
 	}
 	s.respondBlock(ctx, w, block, includeEvents)
 }

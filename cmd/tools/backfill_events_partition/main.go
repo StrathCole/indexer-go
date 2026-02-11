@@ -275,6 +275,11 @@ func main() {
 		log.Fatalf("Failed to connect to ClickHouse: %v", err)
 	}
 
+	pg, err := db.NewPostgres(cfg.Database.PostgresConn)
+	if err != nil {
+		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
+	}
+
 	ctx := context.Background()
 
 	var targetHeights []int64
@@ -295,20 +300,28 @@ func main() {
 		}
 		log.Printf("Backfilling %d explicit heights", len(targetHeights))
 	} else {
-		var minH, maxH uint64
-		var blockCount uint64
-		if err := ch.Conn.QueryRow(ctx,
-			"SELECT min(height), max(height), count() FROM blocks WHERE toYYYYMM(block_time) = ?",
-			*partition,
+		// Query blocks from PostgreSQL (migrated from ClickHouse)
+		var minH, maxH *int64
+		var blockCount int64
+		partStr := fmt.Sprintf("%d", *partition)
+		year := partStr[:4]
+		month := partStr[4:]
+		startDate := fmt.Sprintf("%s-%s-01", year, month)
+		if err := pg.Pool.QueryRow(ctx,
+			`SELECT min(height), max(height), count(*)
+			 FROM blocks
+			 WHERE block_time >= $1::date
+			   AND block_time < ($1::date + INTERVAL '1 month')`,
+			startDate,
 		).Scan(&minH, &maxH, &blockCount); err != nil {
 			log.Fatalf("Failed to query blocks partition %d: %v", *partition, err)
 		}
-		if blockCount == 0 {
+		if blockCount == 0 || minH == nil || maxH == nil {
 			log.Fatalf("No blocks found for partition %d; cannot derive height range", *partition)
 		}
 
-		startH := int64(minH)
-		endH := int64(maxH)
+		startH := *minH
+		endH := *maxH
 		if *startOverride > 0 {
 			startH = *startOverride
 		}

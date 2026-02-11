@@ -371,6 +371,26 @@ func main() {
 				log.Fatalf("Failed to send batch: %v", err)
 			}
 
+			// Dual-write to PostgreSQL for fast account-history lookups
+			pgAccountTxs := make([]db.PgAccountTx, len(accountTxs))
+			for i, at := range accountTxs {
+				pgAccountTxs[i] = db.PgAccountTx{
+					AddressID:    at.AddressID,
+					Height:       at.Height,
+					IndexInBlock: at.IndexInBlock,
+					BlockTime:    at.BlockTime,
+					TxHash:       at.TxHash,
+					Direction:    at.Direction,
+					MainDenomID:  at.MainDenomID,
+					MainAmount:   at.MainAmount,
+					IsBlockEvent: at.IsBlockEvent,
+					EventScope:   at.EventScope,
+				}
+			}
+			if err := pg.InsertAccountTxs(ctx, pgAccountTxs); err != nil {
+				log.Printf("Warning: failed to insert account_txs into PostgreSQL: %v", err)
+			}
+
 			totalAccountTxs += len(accountTxs)
 		}
 

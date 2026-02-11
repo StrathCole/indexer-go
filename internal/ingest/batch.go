@@ -3,8 +3,10 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
+	"github.com/classic-terra/indexer-go/internal/db"
 	"github.com/classic-terra/indexer-go/internal/model"
 )
 
@@ -80,6 +82,7 @@ func (s *Service) BatchInsert(
 	}
 
 	if len(accountTxs) > 0 {
+		// Dual-write: ClickHouse (for dashboard aggregations) + PostgreSQL (for account history lookups)
 		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO account_txs")
 		if err != nil {
 			return fmt.Errorf("failed to prepare account_txs batch: %w", err)
@@ -104,27 +107,42 @@ func (s *Service) BatchInsert(
 		if err := batch.Send(); err != nil {
 			return fmt.Errorf("failed to send account_txs batch: %w", err)
 		}
-	}
 
-	if len(oraclePrices) > 0 {
-		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO oracle_prices")
-		if err != nil {
-			return fmt.Errorf("failed to prepare oracle_prices batch: %w", err)
-		}
-		for _, op := range oraclePrices {
-			err := batch.Append(
-				op.BlockTime,
-				op.Height,
-				op.Denom,
-				op.Price,
-				op.Currency,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to append oracle_price: %w", err)
+		// PostgreSQL dual-write for fast account-history lookups
+		pgAccountTxs := make([]db.PgAccountTx, len(accountTxs))
+		for i, at := range accountTxs {
+			pgAccountTxs[i] = db.PgAccountTx{
+				AddressID:    at.AddressID,
+				Height:       at.Height,
+				IndexInBlock: at.IndexInBlock,
+				BlockTime:    at.BlockTime,
+				TxHash:       at.TxHash,
+				Direction:    at.Direction,
+				MainDenomID:  at.MainDenomID,
+				MainAmount:   at.MainAmount,
+				IsBlockEvent: at.IsBlockEvent,
+				EventScope:   at.EventScope,
 			}
 		}
-		if err := batch.Send(); err != nil {
-			return fmt.Errorf("failed to send oracle_prices batch: %w", err)
+		if err := s.pg.InsertAccountTxs(ctx, pgAccountTxs); err != nil {
+			log.Printf("Warning: failed to insert account_txs into PostgreSQL: %v", err)
+		}
+	}
+
+	// Oracle prices → PostgreSQL (migrated from ClickHouse)
+	if len(oraclePrices) > 0 {
+		pgPrices := make([]db.PgOraclePrice, len(oraclePrices))
+		for i, op := range oraclePrices {
+			pgPrices[i] = db.PgOraclePrice{
+				BlockTime: op.BlockTime,
+				Height:    op.Height,
+				Denom:     op.Denom,
+				Price:     op.Price,
+				Currency:  op.Currency,
+			}
+		}
+		if err := s.pg.InsertOraclePrices(ctx, pgPrices); err != nil {
+			return fmt.Errorf("failed to insert oracle_prices into PostgreSQL: %w", err)
 		}
 	}
 
@@ -171,32 +189,27 @@ func (s *Service) BatchInsert(
 		}
 	}
 
+	// Blocks → PostgreSQL (migrated from ClickHouse)
 	if len(blocks) > 0 {
-		batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO blocks")
-		if err != nil {
-			return fmt.Errorf("failed to prepare blocks batch: %w", err)
-		}
-		for _, b := range blocks {
-			err := batch.Append(
-				b.Height,
-				b.BlockHash,
-				b.BlockTime,
-				b.ProposerAddress,
-				b.TxCount,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to append block: %w", err)
+		pgBlocks := make([]db.PgBlock, len(blocks))
+		for i, b := range blocks {
+			pgBlocks[i] = db.PgBlock{
+				Height:          b.Height,
+				BlockHash:       b.BlockHash,
+				BlockTime:       b.BlockTime,
+				ProposerAddress: b.ProposerAddress,
+				TxCount:         b.TxCount,
 			}
 		}
-		if err := batch.Send(); err != nil {
-			return fmt.Errorf("failed to send blocks batch: %w", err)
+		if err := s.pg.InsertBlocks(ctx, pgBlocks); err != nil {
+			return fmt.Errorf("failed to insert blocks into PostgreSQL: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func (s *Service) insertRegisteredAccountsDaily(ctx context.Context, blockTime time.Time, count uint64) error {
+func (s *Service) insertRegisteredAccountsDailyTx(ctx context.Context, blockTime time.Time, count uint64) error {
 	if count == 0 {
 		return nil
 	}
@@ -204,15 +217,15 @@ func (s *Service) insertRegisteredAccountsDaily(ctx context.Context, blockTime t
 	u := blockTime.UTC()
 	day := time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 
-	batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO registered_accounts_daily")
+	batch, err := s.ch.Conn.PrepareBatch(ctx, "INSERT INTO registered_accounts_daily_tx")
 	if err != nil {
-		return fmt.Errorf("failed to prepare registered_accounts_daily batch: %w", err)
+		return fmt.Errorf("failed to prepare registered_accounts_daily_tx batch: %w", err)
 	}
 	if err := batch.Append(day, count); err != nil {
-		return fmt.Errorf("failed to append registered_accounts_daily row: %w", err)
+		return fmt.Errorf("failed to append registered_accounts_daily_tx row: %w", err)
 	}
 	if err := batch.Send(); err != nil {
-		return fmt.Errorf("failed to send registered_accounts_daily batch: %w", err)
+		return fmt.Errorf("failed to send registered_accounts_daily_tx batch: %w", err)
 	}
 	return nil
 }

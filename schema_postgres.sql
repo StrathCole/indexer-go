@@ -94,3 +94,54 @@ CREATE TABLE IF NOT EXISTS rich_list_meta (
 );
 
 INSERT INTO rich_list_meta (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================
+-- Migrated from ClickHouse for faster point-lookup access
+-- ============================================================
+
+-- Blocks (migrated from ClickHouse)
+CREATE TABLE IF NOT EXISTS blocks (
+    height           BIGINT PRIMARY KEY,
+    block_hash       CHAR(64) NOT NULL,
+    block_time       TIMESTAMPTZ NOT NULL,
+    proposer_address TEXT NOT NULL,
+    tx_count         INT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_blocks_block_time ON blocks(block_time);
+
+-- Oracle Prices (migrated from ClickHouse)
+CREATE TABLE IF NOT EXISTS oracle_prices (
+    id               BIGSERIAL PRIMARY KEY,
+    block_time       TIMESTAMPTZ NOT NULL,
+    height           BIGINT NOT NULL,
+    denom            TEXT NOT NULL,
+    price            DOUBLE PRECISION NOT NULL,
+    currency         TEXT NOT NULL DEFAULT 'uusd'
+);
+
+CREATE INDEX IF NOT EXISTS idx_oracle_prices_denom_time ON oracle_prices(denom, block_time DESC);
+CREATE INDEX IF NOT EXISTS idx_oracle_prices_time ON oracle_prices(block_time);
+
+-- Account Txs (dual-written: ClickHouse for dashboard aggregations,
+--              PostgreSQL for fast account-history lookups)
+CREATE TABLE IF NOT EXISTS account_txs (
+    address_id       BIGINT NOT NULL,
+    height           BIGINT NOT NULL,
+    index_in_block   SMALLINT NOT NULL,
+    block_time       TIMESTAMPTZ NOT NULL,
+    tx_hash          CHAR(64) NOT NULL,
+    direction        SMALLINT NOT NULL DEFAULT 0,
+    main_denom_id    SMALLINT NOT NULL DEFAULT 0,
+    main_amount      BIGINT NOT NULL DEFAULT 0,
+    is_block_event   BOOLEAN NOT NULL DEFAULT false,
+    event_scope      SMALLINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (address_id, height, index_in_block, is_block_event)
+);
+
+-- Main query: account history, paginated descending
+CREATE INDEX IF NOT EXISTS idx_account_txs_addr_height
+    ON account_txs(address_id, height DESC, index_in_block DESC);
+
+CREATE INDEX IF NOT EXISTS idx_account_txs_time ON account_txs(block_time);
+CREATE INDEX IF NOT EXISTS idx_account_txs_hash ON account_txs(tx_hash);

@@ -302,8 +302,8 @@ func (s *Service) startLiveIngest(ctx context.Context) {
 				height := data.Block.Height
 				log.Printf("Live Ingest: New block %d", height)
 
-				// Check if exists first
-				exists, err := s.ch.BlockExists(ctx, height)
+				// Check if exists first (PostgreSQL - migrated from ClickHouse)
+				exists, err := s.pg.BlockExists(ctx, height)
 				if err != nil {
 					log.Printf("Live Ingest: Failed to check block %d: %v", height, err)
 					continue
@@ -397,7 +397,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 			}
 
 			// Check if chunk is full
-			count, err := s.ch.CountBlocksInRange(ctx, s.backfillCursor, endRange)
+			count, err := s.pg.CountBlocksInRange(ctx, s.backfillCursor, endRange)
 			if err != nil {
 				log.Printf("Backfill: Failed to count blocks: %v", err)
 				break
@@ -416,7 +416,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 				batchSize = 10
 			}
 
-			gaps, err := s.ch.FindGapsInRange(ctx, s.backfillCursor, endRange, batchSize)
+			gaps, err := s.pg.FindGapsInRange(ctx, s.backfillCursor, endRange, batchSize)
 			if err != nil {
 				log.Printf("Backfill: Failed to find gaps: %v", err)
 				break
@@ -439,7 +439,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 	} else {
 		// Append mode - process consecutive blocks
 		if s.backfillCursor == 0 {
-			maxHeight, err := s.ch.GetMaxHeight(ctx)
+			maxHeight, err := s.pg.GetMaxHeight(ctx)
 			if err != nil {
 				log.Printf("Backfill: Failed to get max height: %v", err)
 				return true
@@ -470,7 +470,7 @@ func (s *Service) backfillStep(ctx context.Context) bool {
 		}
 
 		// Get existing heights to skip already processed blocks
-		existing, err := s.ch.GetExistingHeightsInRange(ctx, s.backfillCursor, endBlock)
+		existing, err := s.pg.GetExistingHeightsInRange(ctx, s.backfillCursor, endBlock)
 		if err != nil {
 			log.Printf("Backfill: Failed to check existing blocks: %v", err)
 			return true
@@ -818,7 +818,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelTxs []model.Tx
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
-	var newAccounts uint64
+	var newAccountsTx uint64
 
 	// Convert Block Events (BeginBlock & EndBlock)
 	beginBlockEvents := s.convertBlockEvents(
@@ -838,7 +838,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	modelEvents = append(modelEvents, endBlockEvents...)
 
 	// Extract account activity from block events (stored in account_txs with special index values)
-	beginBlockAccountTxs, beginNewAccounts, err := s.extractAccountBlockEvents(
+	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -849,10 +849,9 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		log.Printf("Failed to extract begin_block account relations: %v", err)
 	} else {
 		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
-		newAccounts += beginNewAccounts
 	}
 
-	endBlockAccountTxs, endNewAccounts, err := s.extractAccountBlockEvents(
+	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -863,7 +862,6 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		log.Printf("Failed to extract end_block account relations: %v", err)
 	} else {
 		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
-		newAccounts += endNewAccounts
 	}
 
 	for i, txBytes := range block.Block.Txs {
@@ -891,7 +889,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		modelTxs = append(modelTxs, *modelTx)
 		modelEvents = append(modelEvents, events...)
 		modelAccountTxs = append(modelAccountTxs, accountTxs...)
-		newAccounts += txNewAccounts
+		newAccountsTx += txNewAccounts
 	}
 
 	// Insert everything in one batch
@@ -901,9 +899,9 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		return err
 	}
 
-	if newAccounts > 0 {
-		if err := s.insertRegisteredAccountsDaily(context.Background(), block.Block.Time, newAccounts); err != nil {
-			log.Printf("Failed to update registered_accounts_daily: %v", err)
+	if newAccountsTx > 0 {
+		if err := s.insertRegisteredAccountsDailyTx(context.Background(), block.Block.Time, newAccountsTx); err != nil {
+			log.Printf("Failed to update registered_accounts_daily_tx: %v", err)
 		}
 	}
 

@@ -33,7 +33,7 @@ WHERE is_block_event = 0
 GROUP BY day;
 `
 	createFirstSeenTable = `
-CREATE TABLE IF NOT EXISTS address_first_seen (
+CREATE TABLE IF NOT EXISTS address_first_seen_tx (
     address_id UInt64,
     first_seen_state AggregateFunction(min, DateTime64(3))
 )
@@ -41,17 +41,18 @@ ENGINE = AggregatingMergeTree
 ORDER BY (address_id);
 `
 	createFirstSeenMV = `
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_address_first_seen
-TO address_first_seen
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_address_first_seen_tx
+TO address_first_seen_tx
 AS
 SELECT
     address_id,
     minState(block_time) AS first_seen_state
 FROM account_txs
+WHERE is_block_event = 0
 GROUP BY address_id;
 `
 	createRegisteredDailyTable = `
-CREATE TABLE IF NOT EXISTS registered_accounts_daily (
+CREATE TABLE IF NOT EXISTS registered_accounts_daily_tx (
 	day Date,
 	value UInt64
 )
@@ -95,8 +96,8 @@ func main() {
 	backfillOnly := flag.Bool("backfill-only", false, "Only backfill data (assumes tables exist)")
 	fromPartition := flag.Int("from-partition", 0, "Optional start partition YYYYMM (e.g. 202311)")
 	toPartition := flag.Int("to-partition", 0, "Optional end partition YYYYMM (e.g. 202412)")
-	rebuildRegisteredDaily := flag.Bool("rebuild-registered-daily", false, "Rebuild registered_accounts_daily from address_first_seen (can take minutes for millions of accounts)")
-	truncateRegisteredDaily := flag.Bool("truncate-registered-daily", false, "TRUNCATE registered_accounts_daily before rebuilding")
+	rebuildRegisteredDaily := flag.Bool("rebuild-registered-daily", false, "Rebuild registered_accounts_daily_tx from address_first_seen_tx (can take minutes for millions of accounts)")
+	truncateRegisteredDaily := flag.Bool("truncate-registered-daily", false, "TRUNCATE registered_accounts_daily_tx before rebuilding")
 	optimize := flag.Bool("optimize", false, "Run OPTIMIZE TABLE ... FINAL after backfill (can be expensive)")
 	flag.Parse()
 
@@ -172,7 +173,7 @@ func main() {
 	log.Printf("Backfilling aggregates from account_txs partitions %d..%d", startYM.int(), endYM.int())
 
 	insertDailyActive := "INSERT INTO account_txs_daily_active_tx SELECT toDate(block_time) AS day, uniqCombined64State(address_id) AS active_state FROM account_txs WHERE is_block_event = 0 AND toYYYYMM(block_time) = ? GROUP BY day"
-	insertFirstSeen := "INSERT INTO address_first_seen SELECT address_id, minState(block_time) AS first_seen_state FROM account_txs WHERE toYYYYMM(block_time) = ? GROUP BY address_id"
+	insertFirstSeen := "INSERT INTO address_first_seen_tx SELECT address_id, minState(block_time) AS first_seen_state FROM account_txs WHERE is_block_event = 0 AND toYYYYMM(block_time) = ? GROUP BY address_id"
 
 	for ym := startYM; ym.int() <= endYM.int(); ym = ym.next() {
 		part := ym.int()
@@ -184,7 +185,7 @@ func main() {
 
 		log.Printf("Partition %d: backfilling address first-seen...", part)
 		if err := ch.Conn.Exec(ctx, insertFirstSeen, part); err != nil {
-			log.Fatalf("Partition %d: failed to backfill address_first_seen: %v", part, err)
+			log.Fatalf("Partition %d: failed to backfill address_first_seen_tx: %v", part, err)
 		}
 
 		log.Printf("Partition %d: done in %s", part, time.Since(startTime))
@@ -195,22 +196,22 @@ func main() {
 		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE account_txs_daily_active_tx FINAL"); err != nil {
 			log.Fatalf("Failed to optimize account_txs_daily_active_tx: %v", err)
 		}
-		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE address_first_seen FINAL"); err != nil {
-			log.Fatalf("Failed to optimize address_first_seen: %v", err)
+		if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE address_first_seen_tx FINAL"); err != nil {
+			log.Fatalf("Failed to optimize address_first_seen_tx: %v", err)
 		}
 	}
 
 	if *rebuildRegisteredDaily {
-		log.Printf("Rebuilding registered_accounts_daily from address_first_seen...")
+		log.Printf("Rebuilding registered_accounts_daily_tx from address_first_seen_tx...")
 		if *truncateRegisteredDaily {
-			if err := ch.Conn.Exec(ctx, "TRUNCATE TABLE registered_accounts_daily"); err != nil {
-				log.Fatalf("Failed to truncate registered_accounts_daily: %v", err)
+			if err := ch.Conn.Exec(ctx, "TRUNCATE TABLE registered_accounts_daily_tx"); err != nil {
+				log.Fatalf("Failed to truncate registered_accounts_daily_tx: %v", err)
 			}
 		}
 
 		// One-time heavy aggregation (millions of accounts) but results in a tiny daily table.
 		buildSQL := `
-			INSERT INTO registered_accounts_daily
+			INSERT INTO registered_accounts_daily_tx
 			SELECT
 				toDate(first_seen) AS day,
 				count() AS value
@@ -218,7 +219,7 @@ func main() {
 				SELECT
 					address_id,
 					minMerge(first_seen_state) AS first_seen
-				FROM address_first_seen
+				FROM address_first_seen_tx
 				GROUP BY address_id
 			)
 			GROUP BY day
@@ -226,13 +227,13 @@ func main() {
 		`
 		start := time.Now()
 		if err := ch.Conn.Exec(ctx, buildSQL); err != nil {
-			log.Fatalf("Failed to rebuild registered_accounts_daily: %v", err)
+			log.Fatalf("Failed to rebuild registered_accounts_daily_tx: %v", err)
 		}
 		log.Printf("registered_accounts_daily rebuild complete in %s", time.Since(start))
 
 		if *optimize {
-			if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE registered_accounts_daily FINAL"); err != nil {
-				log.Fatalf("Failed to optimize registered_accounts_daily: %v", err)
+			if err := ch.Conn.Exec(ctx, "OPTIMIZE TABLE registered_accounts_daily_tx FINAL"); err != nil {
+				log.Fatalf("Failed to optimize registered_accounts_daily_tx: %v", err)
 			}
 		}
 	}

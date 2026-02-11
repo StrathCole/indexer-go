@@ -131,27 +131,28 @@ FROM account_txs
 WHERE is_block_event = 0
 GROUP BY day;
 
--- First seen timestamp per address_id (used for /v1/dashboard/registered_accounts and /v1/dashboard/account_growth).
--- This keeps one aggregated state per address and can be merged incrementally.
-CREATE TABLE IF NOT EXISTS address_first_seen (
+-- First seen timestamp per address_id from transactions only.
+-- This intentionally excludes begin_block/end_block derived rows (is_block_event=1).
+CREATE TABLE IF NOT EXISTS address_first_seen_tx (
     address_id UInt64,
     first_seen_state AggregateFunction(min, DateTime64(3))
 )
 ENGINE = AggregatingMergeTree
 ORDER BY (address_id);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_address_first_seen
-TO address_first_seen
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_address_first_seen_tx
+TO address_first_seen_tx
 AS
 SELECT
     address_id,
     minState(block_time) AS first_seen_state
 FROM account_txs
+WHERE is_block_event = 0
 GROUP BY address_id;
 
--- Optional derived table: daily new accounts (fast dashboard queries).
--- This is intended to be backfilled/rebuilt by a tool or job, not incrementally updated by MV.
-CREATE TABLE IF NOT EXISTS registered_accounts_daily (
+-- Optional derived table: daily new accounts from transactions only.
+-- This is maintained incrementally by ingest (counting newly inserted addresses during tx processing).
+CREATE TABLE IF NOT EXISTS registered_accounts_daily_tx (
     day Date,
     value UInt64
 )

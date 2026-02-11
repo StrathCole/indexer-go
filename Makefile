@@ -18,6 +18,7 @@ build-tools:
 	go build -o build/fix_timestamps ./cmd/tools/fix_timestamps
 	go build -o build/backfill_account_blocks ./cmd/tools/backfill_account_blocks
 	go build -o build/backfill_dashboard_aggregates ./cmd/tools/backfill_dashboard_aggregates
+	go build -o build/migrate_ch_to_pg ./cmd/tools/migrate_ch_to_pg
 
 clean:
 	rm -rf build

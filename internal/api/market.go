@@ -74,7 +74,7 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 			lastPrice = 1.0
 		}
 
-		// 2. Get History
+		// 2. Get History (from PostgreSQL)
 		history, err := s.fetchMarketHistory(denom, interval)
 		if err != nil {
 			// Log error but return partial?
@@ -85,17 +85,8 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 		oneDayVariation := "0"
 		oneDayVariationRate := "0"
 
-		// Fetch price 24h ago (approximate using last price before 24h ago)
-		var price24hAgo float64
-		// We use argMax to get the price at the latest timestamp before 24h ago
-		// Restrict lookback to avoid picking up ancient prices (e.g. pre-crash)
-		err = s.ch.Conn.QueryRow(context.Background(), `
-			SELECT price 
-			FROM oracle_prices 
-			WHERE denom = ? AND block_time <= now() - INTERVAL 24 HOUR AND block_time >= now() - INTERVAL 48 HOUR
-			ORDER BY block_time DESC 
-			LIMIT 1
-		`, denom).Scan(&price24hAgo)
+		// Fetch price 24h ago from PostgreSQL
+		price24hAgo, err := s.pg.GetPrice24hAgo(context.Background(), denom)
 
 		if err == nil && price24hAgo > 0 && lastPrice > 0 {
 			diff := lastPrice - price24hAgo
@@ -114,74 +105,17 @@ func (s *Server) GetMarketPrice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fetchMarketHistory(denom string, interval string) ([]interface{}, error) {
-	var timeFunc string
-	var duration time.Duration
+	limit := 50
 
-	switch interval {
-	case "1m":
-		timeFunc = "toStartOfMinute(block_time)"
-		duration = 24 * time.Hour
-	case "5m":
-		timeFunc = "toStartOfFiveMinute(block_time)"
-		duration = 24 * time.Hour
-	case "15m":
-		timeFunc = "toStartOfFifteenMinutes(block_time)"
-		duration = 3 * 24 * time.Hour
-	case "30m":
-		timeFunc = "toStartOfInterval(block_time, INTERVAL 30 minute)"
-		duration = 5 * 24 * time.Hour
-	case "1h":
-		timeFunc = "toStartOfHour(block_time)"
-		duration = 7 * 24 * time.Hour
-	case "1d":
-		timeFunc = "toStartOfDay(block_time)"
-		duration = 30 * 24 * time.Hour // 30 days default
-	default:
-		timeFunc = "toStartOfDay(block_time)"
-		duration = 30 * 24 * time.Hour
-	}
-
-	startTime := time.Now().Add(-duration)
-
-	type PriceRow struct {
-		Time  uint64  `ch:"datetime"`
-		Price float64 `ch:"price"`
-	}
-
-	var rows []PriceRow
-	sql := fmt.Sprintf(`
-		SELECT 
-			toUnixTimestamp(%s)*1000 as datetime, 
-			avg(price) as price 
-		FROM oracle_prices 
-		WHERE denom = ? AND block_time >= ?
-		GROUP BY datetime 
-		ORDER BY datetime DESC
-		LIMIT 50
-	`, timeFunc)
-
-	// Note: context.Background() is used here, but we should ideally use request context if available.
-	// But fetchMarketHistory signature doesn't have it.
-	// Using context.Background() is fine for now.
-	err := s.ch.Conn.Select(context.Background(), &rows, sql, denom, startTime)
+	rows, err := s.pg.GetPriceHistory(context.Background(), denom, interval, limit)
 	if err != nil {
 		return nil, err
 	}
 
+	// Reverse to ASC order (GetPriceHistory returns DESC)
 	var result []interface{}
-	// Reverse to match ASC order expected by frontend?
-	// Legacy returns `reverse()` of `ORDER BY time DESC`. So it returns ASC.
-	// My query is `ORDER BY datetime DESC LIMIT 50`.
-	// So I get latest 50.
-	// Then I should reverse them to be ASC.
-
 	for i := len(rows) - 1; i >= 0; i-- {
-		r := rows[i]
-		result = append(result, map[string]interface{}{
-			"denom":    denom,
-			"datetime": r.Time,
-			"price":    r.Price,
-		})
+		result = append(result, rows[i])
 	}
 
 	if result == nil {
@@ -208,23 +142,10 @@ func (s *Server) GetMarketSwapRate(w http.ResponseWriter, r *http.Request) {
 			priceMap[r.Denom] = val
 		}
 
-		// Fetch prices 24h ago
-		type PriceRow struct {
-			Denom string  `ch:"denom"`
-			Price float64 `ch:"price"`
-		}
-		var rows []PriceRow
-		sql := `
-			SELECT denom, argMax(price, block_time) as price
-			FROM oracle_prices
-			WHERE block_time <= now() - INTERVAL 24 HOUR AND block_time >= now() - INTERVAL 48 HOUR
-			GROUP BY denom
-		`
-		_ = s.ch.Conn.Select(context.Background(), &rows, sql)
-
-		lastDayPriceMap := make(map[string]float64)
-		for _, r := range rows {
-			lastDayPriceMap[r.Denom] = r.Price
+		// Fetch prices 24h ago from PostgreSQL
+		lastDayPriceMap, _ := s.pg.GetAllPrices24hAgo(context.Background())
+		if lastDayPriceMap == nil {
+			lastDayPriceMap = make(map[string]float64)
 		}
 
 		var result []map[string]interface{}

@@ -390,30 +390,16 @@ func (s *Server) GetStakingReturn(w http.ResponseWriter, r *http.Request) {
 		// We lack avg_staking history.
 		// We will return 0s for now but correct structure.
 
-		type Return struct {
-			Time   uint64 `json:"datetime" ch:"datetime"`
-			Amount string `json:"dailyReturn" ch:"dailyReturn"`
-		}
-
-		var returns []Return
-		// Use blocks table to generate timeline if events are missing
-		sql := `
-			SELECT 
-				toUnixTimestamp(toStartOfDay(block_time))*1000 as datetime, 
-				'0' as dailyReturn 
-			FROM blocks
-			GROUP BY datetime 
-			ORDER BY datetime ASC
-		`
-		err := s.ch.Conn.Select(context.Background(), &returns, sql)
+		// Use PostgreSQL blocks table for day timeline
+		days, err := s.pg.GetDayTimeline(context.Background())
 		if err != nil {
 			return []interface{}{}, nil
 		}
 
 		var result []map[string]interface{}
-		for _, r := range returns {
+		for _, d := range days {
 			result = append(result, map[string]interface{}{
-				"datetime":         r.Time,
+				"datetime":         d,
 				"dailyReturn":      "0",
 				"annualizedReturn": "0",
 			})
@@ -546,7 +532,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 			SELECT
 				toUnixTimestamp(day) * 1000 AS datetime,
 				sum(value) AS count
-			FROM registered_accounts_daily
+			FROM registered_accounts_daily_tx
 			GROUP BY day
 			ORDER BY day ASC
 		`
@@ -561,7 +547,7 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 					SELECT
 						address_id,
 						minMerge(first_seen_state) AS first_seen
-					FROM address_first_seen
+					FROM address_first_seen_tx
 					GROUP BY address_id
 				)
 				GROUP BY datetime
@@ -576,7 +562,8 @@ func (s *Server) GetAccountGrowth(w http.ResponseWriter, r *http.Request) {
 						count() as count 
 					FROM (
 						SELECT address_id, min(block_time) as min_time 
-						FROM account_txs 
+						FROM account_txs
+						WHERE is_block_event = 0
 						GROUP BY address_id
 					) 
 					GROUP BY datetime 
@@ -689,9 +676,11 @@ func (s *Server) GetActiveAccounts(w http.ResponseWriter, r *http.Request) {
 		// Weird naming.
 
 		// We need total accounts count.
-		// Prefer ClickHouse daily table (fast). Fallback to Postgres count(*) if needed.
-		if err := s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily").Scan(&total); err != nil || total == 0 {
-			_ = s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
+		// Prefer ClickHouse tx-only daily table (fast).
+		// NOTE: We intentionally do NOT fall back to Postgres `addresses` count here because
+		// that includes addresses first seen in block events; registered accounts is defined as tx-seen.
+		if err := s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily_tx").Scan(&total); err != nil || total == 0 {
+			_ = s.ch.Conn.QueryRow(context.Background(), "SELECT uniq(address_id) FROM account_txs WHERE is_block_event = 0").Scan(&total)
 		}
 
 		if active == nil {
@@ -710,9 +699,9 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 		var total uint64
 		var err error
 		// Prefer ClickHouse daily table (fast). Fallback to Postgres count(*) if needed.
-		err = s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily").Scan(&total)
+		err = s.ch.Conn.QueryRow(context.Background(), "SELECT sum(value) FROM registered_accounts_daily_tx").Scan(&total)
 		if err != nil || total == 0 {
-			err = s.pg.Pool.QueryRow(context.Background(), "SELECT count(*) FROM addresses").Scan(&total)
+			err = s.ch.Conn.QueryRow(context.Background(), "SELECT uniq(address_id) FROM account_txs WHERE is_block_event = 0").Scan(&total)
 			if err != nil {
 				return nil, err
 			}
@@ -727,7 +716,7 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 			SELECT
 				toUnixTimestamp(day) * 1000 AS datetime,
 				sum(value) AS value
-			FROM registered_accounts_daily
+			FROM registered_accounts_daily_tx
 			GROUP BY day
 			ORDER BY day ASC
 		`
@@ -742,7 +731,7 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 					SELECT
 						address_id,
 						minMerge(first_seen_state) AS first_seen
-					FROM address_first_seen
+					FROM address_first_seen_tx
 					GROUP BY address_id
 				)
 				GROUP BY datetime
@@ -757,7 +746,8 @@ func (s *Server) GetRegisteredAccounts(w http.ResponseWriter, r *http.Request) {
 						count() as value 
 					FROM (
 						SELECT address_id, min(block_time) as min_time 
-						FROM account_txs 
+						FROM account_txs
+						WHERE is_block_event = 0
 						GROUP BY address_id
 					) 
 					GROUP BY datetime 
