@@ -27,6 +27,8 @@ func main() {
 	batchSize := flag.Int("batch", 50000, "Rows per batch read from ClickHouse")
 	startHeight := flag.Int64("start-height", 0, "Start height for account_txs (0 = from min)")
 	endHeight := flag.Int64("end-height", 0, "End height for account_txs (0 = to max)")
+	oracleStartHeight := flag.Int64("oracle-start-height", 0, "Start height for oracle_prices (0 = from min)")
+	oracleEndHeight := flag.Int64("oracle-end-height", 0, "End height for oracle_prices (0 = to max)")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -61,7 +63,7 @@ func main() {
 				log.Fatalf("blocks migration failed: %v", err)
 			}
 		case "oracle_prices":
-			if err := migrateOraclePrices(ctx, ch, pg, *batchSize); err != nil {
+			if err := migrateOraclePrices(ctx, ch, pg, *batchSize, *oracleStartHeight, *oracleEndHeight); err != nil {
 				log.Fatalf("oracle_prices migration failed: %v", err)
 			}
 		case "account_txs":
@@ -157,64 +159,91 @@ func migrateBlocks(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batc
 // oracle_prices
 // ---------------------------------------------------------------------------
 
-func migrateOraclePrices(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batchSize int) error {
+func migrateOraclePrices(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batchSize int, startHeight, endHeight int64) error {
 	log.Println("=== Migrating oracle_prices ===")
 
-	var totalCH uint64
-	if err := ch.Conn.QueryRow(ctx, "SELECT count() FROM oracle_prices").Scan(&totalCH); err != nil {
-		return fmt.Errorf("count oracle_prices in CH: %w", err)
+	var minHeight, maxHeight uint64
+	if err := ch.Conn.QueryRow(ctx,
+		"SELECT min(height), max(height) FROM oracle_prices").Scan(&minHeight, &maxHeight); err != nil {
+		return fmt.Errorf("height range from CH: %w", err)
 	}
-	log.Printf("  ClickHouse oracle_prices: %d", totalCH)
+	if maxHeight == 0 {
+		log.Println("  No oracle_prices rows, nothing to migrate.")
+		return nil
+	}
 
-	// Resume point: max height already in PG for oracle_prices
-	var pgMaxHeight uint64
-	err := pg.Pool.QueryRow(ctx,
-		"SELECT COALESCE(max(height), 0) FROM oracle_prices").Scan(&pgMaxHeight)
-	if err != nil {
-		return fmt.Errorf("pg max oracle_prices height: %w", err)
+	effectiveMin := minHeight
+	effectiveMax := maxHeight
+	if startHeight > 0 {
+		if uint64(startHeight) > maxHeight {
+			return fmt.Errorf("oracle-start-height %d is above max height %d", startHeight, maxHeight)
+		}
+		if uint64(startHeight) > minHeight {
+			effectiveMin = uint64(startHeight)
+		}
 	}
-	if pgMaxHeight > 0 {
-		log.Printf("  Resuming from height > %d", pgMaxHeight)
+	if endHeight > 0 {
+		if uint64(endHeight) < minHeight {
+			return fmt.Errorf("oracle-end-height %d is below min height %d", endHeight, minHeight)
+		}
+		if uint64(endHeight) < maxHeight {
+			effectiveMax = uint64(endHeight)
+		}
 	}
+	if effectiveMin > effectiveMax {
+		return fmt.Errorf("oracle-start-height %d is greater than oracle-end-height %d", effectiveMin, effectiveMax)
+	}
+
+	var totalCH uint64
+	if err := ch.Conn.QueryRow(ctx,
+		"SELECT count() FROM (SELECT height, denom FROM oracle_prices WHERE height >= $1 AND height <= $2 GROUP BY height, denom)",
+		effectiveMin, effectiveMax).Scan(&totalCH); err != nil {
+		return fmt.Errorf("count oracle_prices in CH range: %w", err)
+	}
+	log.Printf("  ClickHouse oracle_prices in range: %d", totalCH)
+	log.Printf("  Height range: %d - %d", effectiveMin, effectiveMax)
 
 	var migrated int64
 	startTime := time.Now()
 
-	for {
+	for start := effectiveMin; start <= effectiveMax; start += uint64(batchSize) {
+		end := start + uint64(batchSize) - 1
+		if end > effectiveMax {
+			end = effectiveMax
+		}
+
 		rows, err := ch.Conn.Query(ctx,
-			"SELECT block_time, height, denom, price, currency "+
-				"FROM oracle_prices WHERE height > $1 ORDER BY height ASC LIMIT $2",
-			pgMaxHeight, batchSize)
+			"SELECT height, denom, "+
+				"any(block_time) AS block_time, "+
+				"any(price) AS price, "+
+				"any(currency) AS currency "+
+				"FROM oracle_prices "+
+				"WHERE height >= $1 AND height <= $2 "+
+				"GROUP BY height, denom",
+			start, end)
 		if err != nil {
 			return fmt.Errorf("query CH oracle_prices: %w", err)
 		}
 
 		var batch []db.PgOraclePrice
-		var maxInBatch uint64
 		for rows.Next() {
 			var p db.PgOraclePrice
-			if err := rows.Scan(&p.BlockTime, &p.Height, &p.Denom,
+			if err := rows.Scan(&p.Height, &p.Denom, &p.BlockTime,
 				&p.Price, &p.Currency); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan oracle_price: %w", err)
 			}
 			batch = append(batch, p)
-			if p.Height > maxInBatch {
-				maxInBatch = p.Height
-			}
 		}
 		rows.Close()
 
-		if len(batch) == 0 {
-			break
+		if len(batch) > 0 {
+			if err := pg.InsertOraclePrices(ctx, batch); err != nil {
+				return fmt.Errorf("insert oracle_prices to PG: %w", err)
+			}
+			migrated += int64(len(batch))
 		}
 
-		if err := pg.InsertOraclePrices(ctx, batch); err != nil {
-			return fmt.Errorf("insert oracle_prices to PG: %w", err)
-		}
-
-		migrated += int64(len(batch))
-		pgMaxHeight = maxInBatch
 		elapsed := time.Since(startTime)
 		rate := float64(migrated) / elapsed.Seconds()
 		remaining := float64(int64(totalCH)-migrated) / rate
