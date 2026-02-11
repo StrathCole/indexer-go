@@ -25,6 +25,8 @@ func main() {
 	tables := flag.String("tables", "blocks,oracle_prices,account_txs",
 		"Comma-separated list of tables to migrate")
 	batchSize := flag.Int("batch", 50000, "Rows per batch read from ClickHouse")
+	startHeight := flag.Int64("start-height", 0, "Start height for account_txs (0 = from min)")
+	endHeight := flag.Int64("end-height", 0, "End height for account_txs (0 = to max)")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -63,7 +65,7 @@ func main() {
 				log.Fatalf("oracle_prices migration failed: %v", err)
 			}
 		case "account_txs":
-			if err := migrateAccountTxs(ctx, ch, pg, *batchSize); err != nil {
+			if err := migrateAccountTxs(ctx, ch, pg, *batchSize, *startHeight, *endHeight); err != nil {
 				log.Fatalf("account_txs migration failed: %v", err)
 			}
 		default:
@@ -232,14 +234,8 @@ func migrateOraclePrices(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres
 // account_txs  (largest table — bulk COPY with indexes dropped)
 // ---------------------------------------------------------------------------
 
-func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batchSize int) error {
+func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, batchSize int, startHeight, endHeight int64) error {
 	log.Println("=== Migrating account_txs ===")
-
-	var totalCH uint64
-	if err := ch.Conn.QueryRow(ctx, "SELECT count() FROM account_txs").Scan(&totalCH); err != nil {
-		return fmt.Errorf("count account_txs in CH: %w", err)
-	}
-	log.Printf("  ClickHouse account_txs: %d", totalCH)
 
 	var minHeight, maxHeight uint64
 	if err := ch.Conn.QueryRow(ctx,
@@ -250,42 +246,47 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 		log.Println("  No account_txs rows, nothing to migrate.")
 		return nil
 	}
-	log.Printf("  Height range: %d - %d", minHeight, maxHeight)
-
-	// Step 1: Terminate backends that might block DDL, then truncate and drop indexes.
-	log.Println("  Terminating other backends using account_txs...")
-	_, _ = pg.Pool.Exec(ctx,
-		`SELECT pg_terminate_backend(pid)
-		 FROM pg_stat_activity
-		 WHERE pid <> pg_backend_pid()
-		   AND datname = current_database()
-		   AND state <> 'idle'`)
-
-	log.Println("  Truncating account_txs and dropping indexes...")
-	ddl := []string{
-		"TRUNCATE account_txs",
-		"ALTER TABLE account_txs DROP CONSTRAINT IF EXISTS account_txs_pkey",
-		"DROP INDEX IF EXISTS idx_account_txs_addr_height",
-		"DROP INDEX IF EXISTS idx_account_txs_time",
-		"DROP INDEX IF EXISTS idx_account_txs_hash",
-	}
-	for _, stmt := range ddl {
-		if _, err := pg.Pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("DDL %q: %w", stmt, err)
+	effectiveMin := minHeight
+	effectiveMax := maxHeight
+	if startHeight > 0 {
+		if uint64(startHeight) > maxHeight {
+			return fmt.Errorf("start-height %d is above max height %d", startHeight, maxHeight)
+		}
+		if uint64(startHeight) > minHeight {
+			effectiveMin = uint64(startHeight)
 		}
 	}
-	log.Println("  Indexes dropped. Starting bulk COPY...")
+	if endHeight > 0 {
+		if uint64(endHeight) < minHeight {
+			return fmt.Errorf("end-height %d is below min height %d", endHeight, minHeight)
+		}
+		if uint64(endHeight) < maxHeight {
+			effectiveMax = uint64(endHeight)
+		}
+	}
+	if effectiveMin > effectiveMax {
+		return fmt.Errorf("start-height %d is greater than end-height %d", effectiveMin, effectiveMax)
+	}
 
-	// Step 2: Stream data with parallel workers using direct COPY (no temp table, no conflict check).
+	var totalCH uint64
+	if err := ch.Conn.QueryRow(ctx,
+		"SELECT count() FROM account_txs WHERE height >= $1 AND height <= $2",
+		effectiveMin, effectiveMax).Scan(&totalCH); err != nil {
+		return fmt.Errorf("count account_txs in CH range: %w", err)
+	}
+	log.Printf("  ClickHouse account_txs in range: %d", totalCH)
+	log.Printf("  Height range: %d - %d", effectiveMin, effectiveMax)
+
+	// Step 1: Stream data with parallel workers using temp tables and ON CONFLICT.
 	const workers = 8
 	type chunk struct{ lo, hi uint64 }
 	chunks := make(chan chunk, workers*2)
 
 	go func() {
-		for lo := minHeight; lo <= maxHeight; lo += uint64(batchSize) {
+		for lo := effectiveMin; lo <= effectiveMax; lo += uint64(batchSize) {
 			hi := lo + uint64(batchSize) - 1
-			if hi > maxHeight {
-				hi = maxHeight
+			if hi > effectiveMax {
+				hi = effectiveMax
 			}
 			chunks <- chunk{lo, hi}
 		}
@@ -332,23 +333,6 @@ func migrateAccountTxs(ctx context.Context, ch *db.ClickHouse, pg *db.Postgres, 
 
 	total := globalMigrated.Load()
 	log.Printf("  COPY complete: %d rows in %s", total, time.Since(startTime).Truncate(time.Second))
-
-	// Step 3: Recreate primary key and indexes.
-	log.Println("  Recreating primary key and indexes (this may take a while)...")
-	idxStart := time.Now()
-	rebuild := []string{
-		"ALTER TABLE account_txs ADD PRIMARY KEY (address_id, height, index_in_block, is_block_event)",
-		"CREATE INDEX idx_account_txs_addr_height ON account_txs(address_id, height DESC, index_in_block DESC)",
-		"CREATE INDEX idx_account_txs_time ON account_txs(block_time)",
-		"CREATE INDEX idx_account_txs_hash ON account_txs(tx_hash)",
-	}
-	for _, stmt := range rebuild {
-		log.Printf("    %s", stmt)
-		if _, err := pg.Pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("rebuild %q: %w", stmt, err)
-		}
-	}
-	log.Printf("  Indexes rebuilt in %s", time.Since(idxStart).Truncate(time.Second))
 
 	log.Printf("  account_txs done: %d rows migrated in %s",
 		total, time.Since(startTime).Truncate(time.Second))
@@ -405,13 +389,44 @@ func copyAccountTxsChunk(ctx context.Context, ch *db.ClickHouse,
 	}
 	defer conn.Release()
 
-	_, err = conn.CopyFrom(ctx,
-		pgx.Identifier{"account_txs"},
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tempName := fmt.Sprintf("_tmp_acctx_%d", lo)
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		`CREATE TEMP TABLE %s (
+			address_id BIGINT, height BIGINT, index_in_block SMALLINT,
+			block_time TIMESTAMPTZ, tx_hash CHAR(64), direction SMALLINT,
+			main_denom_id SMALLINT, main_amount BIGINT,
+			is_block_event BOOLEAN, event_scope SMALLINT
+		) ON COMMIT DROP`, tempName))
+	if err != nil {
+		return 0, fmt.Errorf("create temp table: %w", err)
+	}
+
+	_, err = tx.CopyFrom(ctx,
+		pgx.Identifier{tempName},
 		cols,
 		pgx.CopyFromRows(allRows),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("COPY [%d..%d]: %w", lo, hi, err)
+		return 0, fmt.Errorf("COPY temp [%d..%d]: %w", lo, hi, err)
+	}
+
+	_, err = tx.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO account_txs (%s)
+		 SELECT %s FROM %s
+		 ON CONFLICT (address_id, height, index_in_block, is_block_event) DO NOTHING`,
+		strings.Join(cols, ","), strings.Join(cols, ","), tempName))
+	if err != nil {
+		return 0, fmt.Errorf("merge temp [%d..%d]: %w", lo, hi, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit [%d..%d]: %w", lo, hi, err)
 	}
 
 	return int64(len(allRows)), nil
