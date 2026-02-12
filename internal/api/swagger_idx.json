@@ -122,6 +122,8 @@
         "summary": "List transactions",
         "parameters": [
           { "name": "account", "in": "query", "required": false, "type": "string" },
+          { "name": "account2", "in": "query", "required": false, "type": "string", "description": "When used with account, returns only transactions/events involving both accounts." },
+          { "name": "with_account", "in": "query", "required": false, "type": "string", "description": "Alias for account2." },
           { "name": "block", "in": "query", "required": false, "type": "string" },
           { "name": "limit", "in": "query", "required": false, "type": "integer", "format": "int32" },
           { "name": "offset", "in": "query", "required": false, "type": "integer", "format": "int32" }

@@ -347,26 +347,40 @@ func (pg *Postgres) InsertAccountTxs(ctx context.Context, txs []PgAccountTx) err
 	return nil
 }
 
-func (pg *Postgres) GetAccountActivity(ctx context.Context, addressID uint64, offset uint64, limit int) ([]PgAccountTx, error) {
+func (pg *Postgres) GetAccountActivity(ctx context.Context, addressID uint64, secondAddressID uint64, offset uint64, limit int) ([]PgAccountTx, error) {
 	var args []interface{}
-	sql := `SELECT address_id, height, index_in_block, block_time, tx_hash,
+	sql := `SELECT a1.address_id, a1.height, a1.index_in_block, a1.block_time, a1.tx_hash,
 	               direction, main_denom_id, main_amount, is_block_event, event_scope
-	        FROM account_txs
-	        WHERE address_id = $1`
+	        FROM account_txs a1
+	        WHERE a1.address_id = $1`
 	args = append(args, addressID)
 
 	argIdx := 2
+	if secondAddressID > 0 {
+		sql += fmt.Sprintf(`
+		 AND EXISTS (
+			SELECT 1
+			FROM account_txs a2
+			WHERE a2.address_id = $%d
+			  AND a2.height = a1.height
+			  AND a2.index_in_block = a1.index_in_block
+			  AND a2.is_block_event = a1.is_block_event
+		 )`, argIdx)
+		args = append(args, secondAddressID)
+		argIdx++
+	}
+
 	if offset > 0 {
 		height := offset / 100000
 		index := offset % 100000
 		sql += fmt.Sprintf(
-			" AND (height < $%d OR (height = $%d AND index_in_block < $%d))",
+			" AND (a1.height < $%d OR (a1.height = $%d AND a1.index_in_block < $%d))",
 			argIdx, argIdx+1, argIdx+2)
 		args = append(args, height, height, index)
 		argIdx += 3
 	}
 
-	sql += fmt.Sprintf(" ORDER BY height DESC, index_in_block DESC LIMIT $%d", argIdx)
+	sql += fmt.Sprintf(" ORDER BY a1.height DESC, a1.index_in_block DESC LIMIT $%d", argIdx)
 	args = append(args, limit)
 
 	rows, err := pg.Pool.Query(ctx, sql, args...)

@@ -22,6 +22,10 @@ import (
 func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 	queryParams := r.URL.Query()
 	account := strings.TrimSpace(queryParams.Get("account"))
+	account2 := strings.TrimSpace(queryParams.Get("account2"))
+	if account2 == "" {
+		account2 = strings.TrimSpace(queryParams.Get("with_account"))
+	}
 	block := queryParams.Get("block")
 	limitStr := queryParams.Get("limit")
 	offsetStr := queryParams.Get("offset")
@@ -58,6 +62,11 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 		msgTypes = make(map[uint16]string)
 	}
 
+	if account == "" && account2 != "" {
+		respondError(w, http.StatusBadRequest, "account2 requires account")
+		return
+	}
+
 	if account != "" {
 		// Get address ID
 		var addressID uint64
@@ -72,8 +81,22 @@ func (s *Server) GetTxs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		var secondAddressID uint64
+		if account2 != "" {
+			err = s.pg.Pool.QueryRow(context.Background(), "SELECT id FROM addresses WHERE address = $1", account2).Scan(&secondAddressID)
+			if err != nil {
+				// Address not found, return empty list
+				respondJSON(w, http.StatusOK, map[string]interface{}{
+					"txs":   []interface{}{},
+					"limit": limit,
+					"next":  0,
+				})
+				return
+			}
+		}
+
 		// Query account_txs from PostgreSQL for fast account-history lookups
-		pgAccountTxs, err := s.pg.GetAccountActivity(context.Background(), addressID, offset, limit)
+		pgAccountTxs, err := s.pg.GetAccountActivity(context.Background(), addressID, secondAddressID, offset, limit)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch activity: %v", err))
 			return
