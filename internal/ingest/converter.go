@@ -207,7 +207,7 @@ func (s *Service) convertTx(
 		SignaturesJSON: signaturesJSON,
 		Memo:           memo,
 		RawLog:         res.Log,
-		LogsJSON:       res.Log,
+		LogsJSON:       buildLogsJSONFromEvents(res.Events),
 	}
 
 	// Extract Events
@@ -236,6 +236,74 @@ func (s *Service) convertTx(
 	}
 
 	return modelTx, events, accountTxs, newAccounts, nil
+}
+
+// buildLogsJSONFromEvents converts ABCI events into an FCD-compatible logs JSON string.
+// Events with a msg_index attribute are grouped per-message. Top-level events without
+// msg_index (e.g. coin_spent, tx fee events) are skipped as they carry no message context.
+func buildLogsJSONFromEvents(events []abcitypes.Event) string {
+	type logAttr struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	type logEvent struct {
+		Type       string     `json:"type"`
+		Attributes []logAttr  `json:"attributes"`
+	}
+	type logEntry struct {
+		MsgIndex int        `json:"msg_index"`
+		Log      string     `json:"log"`
+		Events   []logEvent `json:"events"`
+	}
+
+	grouped := make(map[int][]logEvent)
+	maxIdx := -1
+
+	for _, ev := range events {
+		msgIdx := -1
+		for _, attr := range ev.Attributes {
+			if string(attr.Key) == "msg_index" {
+				if idx, err := strconv.Atoi(string(attr.Value)); err == nil {
+					msgIdx = idx
+				}
+				break
+			}
+		}
+		if msgIdx < 0 {
+			continue // top-level event not tied to a message
+		}
+		if msgIdx > maxIdx {
+			maxIdx = msgIdx
+		}
+
+		attrs := make([]logAttr, 0, len(ev.Attributes))
+		for _, attr := range ev.Attributes {
+			if string(attr.Key) == "msg_index" {
+				continue
+			}
+			attrs = append(attrs, logAttr{Key: string(attr.Key), Value: string(attr.Value)})
+		}
+		grouped[msgIdx] = append(grouped[msgIdx], logEvent{Type: ev.Type, Attributes: attrs})
+	}
+
+	if maxIdx < 0 {
+		return ""
+	}
+
+	logs := make([]logEntry, maxIdx+1)
+	for i := 0; i <= maxIdx; i++ {
+		evs := grouped[i]
+		if evs == nil {
+			evs = []logEvent{}
+		}
+		logs[i] = logEntry{MsgIndex: i, Log: "", Events: evs}
+	}
+
+	b, err := json.Marshal(logs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func txBytes(tx sdk.Tx) []byte {

@@ -74,8 +74,11 @@ func main() {
     block_time      DateTime64(3),
     tx_hash         FixedString(64),
 	INDEX idx_tx_hash tx_hash TYPE bloom_filter(0.01) GRANULARITY 4,
+	tx_bytes        String,
     codespace       LowCardinality(String),
     code            UInt32,
+	tx_response_data String,
+	tx_response_info String,
     gas_wanted      UInt64,
     gas_used        UInt64,
     fee_amounts     Array(Int64),
@@ -103,6 +106,7 @@ func main() {
 	INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
 	INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_value      String,
+	attr_index      Bool DEFAULT false,
     tx_hash         FixedString(64) DEFAULT ''
 ) ENGINE = MergeTree PARTITION BY toYYYYMM(block_time) ORDER BY (height, scope, tx_index, event_index, event_type, attr_key)`,
 

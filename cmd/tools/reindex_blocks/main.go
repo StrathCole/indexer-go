@@ -27,6 +27,7 @@ func main() {
 	deleteTimeout := flag.Duration("delete-timeout", 15*time.Minute, "Timeout for each ClickHouse delete mutation")
 	deletePollInterval := flag.Duration("delete-poll-interval", 2*time.Second, "Polling interval while waiting for ClickHouse deletes")
 	progressInterval := flag.Duration("progress-interval", 10*time.Second, "How often to log long-running reindex sub-steps")
+	batchSize := flag.Int("batch-size", 100, "Number of heights to reindex per batch (1 = legacy per-height mode)")
 	dryRun := flag.Bool("dry-run", false, "Fetch and convert target blocks, but do not delete or insert")
 	continueOnError := flag.Bool("continue-on-error", true, "Continue reindexing remaining heights after an error")
 	flag.Parse()
@@ -46,6 +47,9 @@ func main() {
 	}
 	if *progressInterval <= 0 {
 		log.Fatalf("--progress-interval must be > 0")
+	}
+	if *batchSize <= 0 {
+		log.Fatalf("--batch-size must be > 0")
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -96,10 +100,16 @@ func main() {
 	var failed int
 	runStarted := time.Now()
 	total := len(targetHeights)
-	for i, h := range targetHeights {
+	for start := 0; start < len(targetHeights); start += *batchSize {
+		end := start + *batchSize
+		if end > len(targetHeights) {
+			end = len(targetHeights)
+		}
+		chunk := targetHeights[start:end]
 		started := time.Now()
-		log.Printf("Progress %d/%d (%.1f%%): reindexing height %d", i+1, total, percent(i, total), h)
-		summary, err := svc.ReindexBlock(ctx, h, ingest.ReindexOptions{
+
+		log.Printf("Progress %d/%d (%.1f%%): reindexing chunk heights %d..%d (size=%d)", start+1, total, percent(start, total), chunk[0], chunk[len(chunk)-1], len(chunk))
+		summaries, err := svc.ReindexBlocks(ctx, chunk, ingest.ReindexOptions{
 			DeleteTimeout:      *deleteTimeout,
 			DeletePollInterval: *deletePollInterval,
 			ProgressInterval:   *progressInterval,
@@ -107,34 +117,90 @@ func main() {
 			Progress:           log.Printf,
 		})
 		if err != nil {
-			failed++
-			if *continueOnError {
-				log.Printf("Height %d failed: %v", h, err)
-				continue
+			if !*continueOnError {
+				log.Fatalf("Chunk %d..%d failed: %v", chunk[0], chunk[len(chunk)-1], err)
 			}
-			log.Fatalf("Height %d failed: %v", h, err)
+
+			log.Printf("Chunk %d..%d failed: %v", chunk[0], chunk[len(chunk)-1], err)
+			log.Printf("Falling back to per-height mode for this chunk")
+			for _, h := range chunk {
+				summary, singleErr := svc.ReindexBlock(ctx, h, ingest.ReindexOptions{
+					DeleteTimeout:      *deleteTimeout,
+					DeletePollInterval: *deletePollInterval,
+					ProgressInterval:   *progressInterval,
+					DryRun:             *dryRun,
+					Progress:           log.Printf,
+				})
+				if singleErr != nil {
+					failed++
+					log.Printf("Height %d failed: %v", h, singleErr)
+					continue
+				}
+				succeeded++
+				processed := succeeded + failed
+				avg := time.Since(runStarted) / time.Duration(processed)
+				eta := avg * time.Duration(total-processed)
+				log.Printf(
+					"Progress %d/%d (%.1f%%): height %d reindexed in fallback mode, eta=%s, txs=%d events=%d block_events=%d tx_events=%d account_txs=%d oracle_prices=%d validator_returns=%d block_rewards=%d",
+					processed,
+					total,
+					percent(processed, total),
+					summary.Height,
+					eta.Round(time.Second),
+					summary.TxCount,
+					summary.EventCount,
+					summary.BlockEventCount,
+					summary.TxEventCount,
+					summary.AccountTxCount,
+					summary.OraclePriceCount,
+					summary.ValidatorCount,
+					summary.BlockRewardCount,
+				)
+			}
+			continue
 		}
 
-		succeeded++
-		processed := i + 1
+		succeeded += len(summaries)
+		processed := succeeded + failed
 		avg := time.Since(runStarted) / time.Duration(processed)
 		eta := avg * time.Duration(total-processed)
+
+		txCount := 0
+		eventCount := 0
+		blockEventCount := 0
+		txEventCount := 0
+		accountTxCount := 0
+		oraclePriceCount := 0
+		validatorCount := 0
+		blockRewardCount := 0
+		for _, summary := range summaries {
+			txCount += summary.TxCount
+			eventCount += summary.EventCount
+			blockEventCount += summary.BlockEventCount
+			txEventCount += summary.TxEventCount
+			accountTxCount += summary.AccountTxCount
+			oraclePriceCount += summary.OraclePriceCount
+			validatorCount += summary.ValidatorCount
+			blockRewardCount += summary.BlockRewardCount
+		}
+
 		log.Printf(
-			"Progress %d/%d (%.1f%%): height %d reindexed in %s, eta=%s, txs=%d events=%d block_events=%d tx_events=%d account_txs=%d oracle_prices=%d validator_returns=%d block_rewards=%d",
+			"Progress %d/%d (%.1f%%): chunk %d..%d reindexed in %s, eta=%s, txs=%d events=%d block_events=%d tx_events=%d account_txs=%d oracle_prices=%d validator_returns=%d block_rewards=%d",
 			processed,
 			total,
 			percent(processed, total),
-			summary.Height,
+			chunk[0],
+			chunk[len(chunk)-1],
 			time.Since(started),
 			eta.Round(time.Second),
-			summary.TxCount,
-			summary.EventCount,
-			summary.BlockEventCount,
-			summary.TxEventCount,
-			summary.AccountTxCount,
-			summary.OraclePriceCount,
-			summary.ValidatorCount,
-			summary.BlockRewardCount,
+			txCount,
+			eventCount,
+			blockEventCount,
+			txEventCount,
+			accountTxCount,
+			oraclePriceCount,
+			validatorCount,
+			blockRewardCount,
 		)
 	}
 

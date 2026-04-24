@@ -41,6 +41,11 @@ var clickHouseHeightTables = []string{
 	"blocks",
 }
 
+var clickHouseLegacyOptionalTables = map[string]struct{}{
+	"blocks":        {},
+	"oracle_prices": {},
+}
+
 func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOptions) (ReindexSummary, error) {
 	if height <= 0 {
 		return ReindexSummary{}, fmt.Errorf("height must be > 0")
@@ -106,6 +111,149 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 	return summary, nil
 }
 
+func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts ReindexOptions) ([]ReindexSummary, error) {
+	if len(heights) == 0 {
+		return nil, fmt.Errorf("at least one height is required")
+	}
+	if opts.DeleteTimeout <= 0 {
+		opts.DeleteTimeout = 15 * time.Minute
+	}
+	if opts.DeletePollInterval <= 0 {
+		opts.DeletePollInterval = 2 * time.Second
+	}
+	if opts.ProgressInterval <= 0 {
+		opts.ProgressInterval = 10 * time.Second
+	}
+
+	type reindexBlockPayload struct {
+		height           uint64
+		block            model.Block
+		txs              []model.Tx
+		events           []model.Event
+		accountTxs       []model.AccountTx
+		oraclePrices     []model.OraclePrice
+		validatorReturns []model.ValidatorReturn
+		blockRewards     []model.BlockReward
+		affectedDays     []string
+		affectedAddrIDs  []uint64
+	}
+
+	summaries := make([]ReindexSummary, 0, len(heights))
+	payloads := make([]reindexBlockPayload, 0, len(heights))
+
+	for _, h := range heights {
+		if h <= 0 {
+			return nil, fmt.Errorf("height must be > 0: %d", h)
+		}
+
+		opts.progressf("height %d: fetching and converting block", h)
+		block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(h)
+		if err != nil {
+			return nil, fmt.Errorf("fetch and convert height %d: %w", h, err)
+		}
+		if block.Height != uint64(h) {
+			return nil, fmt.Errorf("fetched height mismatch: requested %d, got %d", h, block.Height)
+		}
+
+		summary := ReindexSummary{
+			Height:           block.Height,
+			TxCount:          len(txs),
+			EventCount:       len(events),
+			TxEventCount:     countEventsByScope(events, "tx"),
+			BlockEventCount:  countNonTxEvents(events),
+			AccountTxCount:   len(accountTxs),
+			OraclePriceCount: len(oraclePrices),
+			ValidatorCount:   len(validatorReturns),
+			BlockRewardCount: len(blockRewards),
+		}
+		summaries = append(summaries, summary)
+
+		opts.progressf("height %d: fetched txs=%d events=%d block_events=%d tx_events=%d account_txs=%d", h, summary.TxCount, summary.EventCount, summary.BlockEventCount, summary.TxEventCount, summary.AccountTxCount)
+		if opts.DryRun {
+			continue
+		}
+
+		opts.progressf("height %d: loading aggregate refresh inputs", h)
+		affectedAddressIDs, affectedDays, err := s.reindexAggregateInputs(ctx, block.Height, block.BlockTime, accountTxs)
+		if err != nil {
+			return nil, err
+		}
+		opts.progressf("height %d: aggregate refresh inputs loaded addresses=%d days=%d", h, len(affectedAddressIDs), len(affectedDays))
+
+		payloads = append(payloads, reindexBlockPayload{
+			height:           block.Height,
+			block:            block,
+			txs:              txs,
+			events:           events,
+			accountTxs:       accountTxs,
+			oraclePrices:     oraclePrices,
+			validatorReturns: validatorReturns,
+			blockRewards:     blockRewards,
+			affectedDays:     affectedDays,
+			affectedAddrIDs:  affectedAddressIDs,
+		})
+	}
+
+	if opts.DryRun {
+		return summaries, nil
+	}
+
+	heightSet := make(map[uint64]struct{}, len(payloads))
+	affectedDaySet := make(map[string]struct{})
+	affectedAddressSet := make(map[uint64]struct{})
+
+	allBlocks := make([]model.Block, 0, len(payloads))
+	allTxs := make([]model.Tx, 0)
+	allEvents := make([]model.Event, 0)
+	allAccountTxs := make([]model.AccountTx, 0)
+	allOraclePrices := make([]model.OraclePrice, 0)
+	allValidatorReturns := make([]model.ValidatorReturn, 0)
+	allBlockRewards := make([]model.BlockReward, 0)
+
+	for _, payload := range payloads {
+		heightSet[payload.height] = struct{}{}
+		for _, day := range payload.affectedDays {
+			affectedDaySet[day] = struct{}{}
+		}
+		for _, id := range payload.affectedAddrIDs {
+			affectedAddressSet[id] = struct{}{}
+		}
+
+		allBlocks = append(allBlocks, payload.block)
+		allTxs = append(allTxs, payload.txs...)
+		allEvents = append(allEvents, payload.events...)
+		allAccountTxs = append(allAccountTxs, payload.accountTxs...)
+		allOraclePrices = append(allOraclePrices, payload.oraclePrices...)
+		allValidatorReturns = append(allValidatorReturns, payload.validatorReturns...)
+		allBlockRewards = append(allBlockRewards, payload.blockRewards...)
+	}
+
+	batchHeights := sortedUint64Keys(heightSet)
+	affectedDays := sortedStringKeys(affectedDaySet)
+	affectedAddressIDs := sortedUint64Keys(affectedAddressSet)
+
+	opts.progressf("batch: deleting old rows for %d heights", len(batchHeights))
+	if err := s.deleteBlockDataBatch(ctx, batchHeights, opts); err != nil {
+		return nil, err
+	}
+
+	opts.progressf("batch: inserting fresh rows for %d heights", len(batchHeights))
+	if err := s.BatchInsert(ctx, allBlocks, allTxs, allEvents, allAccountTxs, allOraclePrices, allValidatorReturns, allBlockRewards); err != nil {
+		return nil, fmt.Errorf("insert reindexed heights batch: %w", err)
+	}
+
+	opts.progressf("batch: refreshing aggregates for addresses=%d days=%d", len(affectedAddressIDs), len(affectedDays))
+	if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
+		return nil, err
+	}
+
+	for _, summary := range summaries {
+		opts.progressf("height %d: complete", summary.Height)
+	}
+
+	return summaries, nil
+}
+
 func (opts ReindexOptions) progressf(format string, args ...any) {
 	if opts.Progress != nil {
 		opts.Progress(format, args...)
@@ -133,26 +281,38 @@ func countNonTxEvents(events []model.Event) int {
 }
 
 func (s *Service) deleteBlockData(ctx context.Context, height uint64, opts ReindexOptions) error {
+	return s.deleteBlockDataBatch(ctx, []uint64{height}, opts)
+}
+
+func (s *Service) deleteBlockDataBatch(ctx context.Context, heights []uint64, opts ReindexOptions) error {
+	if len(heights) == 0 {
+		return nil
+	}
+	heightFilter := "height IN (" + joinUint64s(heights) + ")"
+
 	for _, table := range clickHouseHeightTables {
-		opts.progressf("height %d: checking ClickHouse table %s", height, table)
+		opts.progressf("heights=%d: checking ClickHouse table %s", len(heights), table)
 		exists, err := s.clickHouseTableExists(ctx, table)
 		if err != nil {
 			return fmt.Errorf("check ClickHouse table %s: %w", table, err)
 		}
 		if !exists {
-			opts.progressf("height %d: ClickHouse table %s missing, skipping", height, table)
+			if _, legacyOptional := clickHouseLegacyOptionalTables[table]; legacyOptional {
+				continue
+			}
+			opts.progressf("heights=%d: ClickHouse table %s missing, skipping", len(heights), table)
 			continue
 		}
-		if err := s.deleteClickHouseHeight(ctx, table, height, opts); err != nil {
+		if err := s.deleteClickHouseWhere(ctx, table, heightFilter, opts); err != nil {
 			return err
 		}
 	}
 
-	opts.progressf("height %d: deleting PostgreSQL rows", height)
-	if err := s.pg.DeleteBlockData(ctx, height); err != nil {
+	opts.progressf("heights=%d: deleting PostgreSQL rows", len(heights))
+	if err := s.pg.DeleteBlockDataBatch(ctx, heights); err != nil {
 		return err
 	}
-	opts.progressf("height %d: PostgreSQL rows deleted", height)
+	opts.progressf("heights=%d: PostgreSQL rows deleted", len(heights))
 	return nil
 }
 
@@ -242,20 +402,15 @@ func (s *Service) reindexAggregateInputs(ctx context.Context, height uint64, blo
 }
 
 func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uint64, days []string, opts ReindexOptions) error {
-	registeredDaySet := make(map[string]struct{}, len(days))
-	for _, day := range days {
-		registeredDaySet[day] = struct{}{}
-	}
+	oldFirstSeenDayCounts := make(map[string]uint64)
 
 	if len(addressIDs) > 0 {
-		opts.progressf("aggregates: collecting old first-seen days for %d addresses", len(addressIDs))
-		oldFirstSeenDays, err := s.collectAddressFirstSeenDays(ctx, addressIDs)
+		opts.progressf("aggregates: collecting old first-seen day counts for %d addresses", len(addressIDs))
+		counts, err := s.collectAddressFirstSeenDayCounts(ctx, addressIDs)
 		if err != nil {
 			return err
 		}
-		for _, day := range oldFirstSeenDays {
-			registeredDaySet[day] = struct{}{}
-		}
+		oldFirstSeenDayCounts = counts
 	}
 
 	if len(days) > 0 {
@@ -271,19 +426,12 @@ func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uin
 	}
 
 	if len(addressIDs) > 0 {
-		opts.progressf("aggregates: collecting new first-seen days for %d addresses", len(addressIDs))
-		newFirstSeenDays, err := s.collectAddressFirstSeenDays(ctx, addressIDs)
+		opts.progressf("aggregates: collecting new first-seen day counts for %d addresses", len(addressIDs))
+		newFirstSeenDayCounts, err := s.collectAddressFirstSeenDayCounts(ctx, addressIDs)
 		if err != nil {
 			return err
 		}
-		for _, day := range newFirstSeenDays {
-			registeredDaySet[day] = struct{}{}
-		}
-	}
-
-	registeredDays := sortedStringKeys(registeredDaySet)
-	if len(registeredDays) > 0 {
-		if err := s.refreshRegisteredAccountsDailyTx(ctx, registeredDays, opts); err != nil {
+		if err := s.refreshRegisteredAccountsDailyTx(ctx, oldFirstSeenDayCounts, newFirstSeenDayCounts, opts); err != nil {
 			return err
 		}
 	}
@@ -350,37 +498,53 @@ GROUP BY address_id`, ids)
 	return nil
 }
 
-func (s *Service) collectAddressFirstSeenDays(ctx context.Context, addressIDs []uint64) ([]string, error) {
+func (s *Service) collectAddressFirstSeenDayCounts(ctx context.Context, addressIDs []uint64) (map[string]uint64, error) {
 	exists, err := s.clickHouseTableExists(ctx, "address_first_seen_tx")
 	if err != nil {
 		return nil, fmt.Errorf("check ClickHouse address_first_seen_tx: %w", err)
 	}
 	if !exists {
-		return nil, nil
+		return map[string]uint64{}, nil
+	}
+	if len(addressIDs) == 0 {
+		return map[string]uint64{}, nil
 	}
 
-	days := make(map[string]struct{})
+	counts := make(map[string]uint64)
 	for _, chunk := range chunkUint64s(addressIDs, 5000) {
 		query := fmt.Sprintf(`
-SELECT DISTINCT toString(toDate(first_seen))
+SELECT day, count()
 FROM (
-	SELECT address_id, minMerge(first_seen_state) AS first_seen
+	SELECT toString(toDate(minMerge(first_seen_state))) AS day
 	FROM address_first_seen_tx
 	WHERE address_id IN (%s)
 	GROUP BY address_id
-)`, joinUint64s(chunk))
-		chunkDays, err := s.queryClickHouseStringColumn(ctx, query)
+) AS grouped
+GROUP BY day`, joinUint64s(chunk))
+
+		rows, err := s.ch.Conn.Query(ctx, query)
 		if err != nil {
-			return nil, fmt.Errorf("collect address_first_seen_tx days: %w", err)
+			return nil, fmt.Errorf("collect address_first_seen_tx day counts: %w", err)
 		}
-		for _, day := range chunkDays {
+		for rows.Next() {
+			var day string
+			var count uint64
+			if err := rows.Scan(&day, &count); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan address_first_seen_tx day counts: %w", err)
+			}
 			if day != "" {
-				days[day] = struct{}{}
+				counts[day] += count
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate address_first_seen_tx day counts: %w", err)
+		}
+		rows.Close()
 	}
 
-	return sortedStringKeys(days), nil
+	return counts, nil
 }
 
 func (s *Service) queryClickHouseUint64Column(ctx context.Context, query string) ([]uint64, error) {
@@ -425,7 +589,7 @@ func (s *Service) queryClickHouseStringColumn(ctx context.Context, query string)
 	return out, nil
 }
 
-func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []string, opts ReindexOptions) error {
+func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, oldCounts map[string]uint64, newCounts map[string]uint64, opts ReindexOptions) error {
 	exists, err := s.clickHouseTableExists(ctx, "registered_accounts_daily_tx")
 	if err != nil {
 		return fmt.Errorf("check ClickHouse registered_accounts_daily_tx: %w", err)
@@ -434,25 +598,47 @@ func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []s
 		return nil
 	}
 
+	daySet := make(map[string]struct{}, len(oldCounts)+len(newCounts))
+	for day := range oldCounts {
+		daySet[day] = struct{}{}
+	}
+	for day := range newCounts {
+		daySet[day] = struct{}{}
+	}
+	days := sortedStringKeys(daySet)
+
 	for _, day := range days {
-		opts.progressf("aggregates: refreshing registered_accounts_daily_tx for %s", day)
+		oldCount := int64(oldCounts[day])
+		newCount := int64(newCounts[day])
+		delta := newCount - oldCount
+		if delta == 0 {
+			continue
+		}
+
+		opts.progressf("aggregates: adjusting registered_accounts_daily_tx for %s delta=%d", day, delta)
+
+		var current uint64
+		currentQuery := fmt.Sprintf("SELECT toUInt64(ifNull(sum(value), 0)) FROM registered_accounts_daily_tx WHERE day = toDate('%s')", day)
+		if err := s.ch.Conn.QueryRow(ctx, currentQuery).Scan(&current); err != nil {
+			return fmt.Errorf("load registered_accounts_daily_tx current value for %s: %w", day, err)
+		}
+
+		updated := int64(current) + delta
+		if updated < 0 {
+			updated = 0
+		}
+
 		where := fmt.Sprintf("day = toDate('%s')", day)
 		if err := s.deleteClickHouseWhere(ctx, "registered_accounts_daily_tx", where, opts); err != nil {
 			return err
 		}
+		if updated == 0 {
+			continue
+		}
 
-		insertSQL := fmt.Sprintf(`
-INSERT INTO registered_accounts_daily_tx
-SELECT first_seen_day AS day, count() AS value
-FROM (
-	SELECT address_id, toDate(minMerge(first_seen_state)) AS first_seen_day
-	FROM address_first_seen_tx
-	GROUP BY address_id
-)
-WHERE first_seen_day = toDate('%s')
-GROUP BY first_seen_day`, day)
+		insertSQL := fmt.Sprintf("INSERT INTO registered_accounts_daily_tx (day, value) VALUES (toDate('%s'), %d)", day, updated)
 		if err := s.ch.Conn.Exec(ctx, insertSQL); err != nil {
-			return fmt.Errorf("rebuild registered_accounts_daily_tx for %s: %w", day, err)
+			return fmt.Errorf("adjust registered_accounts_daily_tx for %s: %w", day, err)
 		}
 	}
 	return nil

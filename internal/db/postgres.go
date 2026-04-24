@@ -54,19 +54,32 @@ func (pg *Postgres) BlockExists(ctx context.Context, height int64) (bool, error)
 }
 
 func (pg *Postgres) DeleteBlockData(ctx context.Context, height uint64) error {
+	return pg.DeleteBlockDataBatch(ctx, []uint64{height})
+}
+
+func (pg *Postgres) DeleteBlockDataBatch(ctx context.Context, heights []uint64) error {
+	if len(heights) == 0 {
+		return nil
+	}
+
 	tx, err := pg.Pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin block data delete: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
+	heightList := make([]int64, len(heights))
+	for i, h := range heights {
+		heightList[i] = int64(h)
+	}
+
 	for _, stmt := range []string{
-		"DELETE FROM account_txs WHERE height = $1",
-		"DELETE FROM oracle_prices WHERE height = $1",
-		"DELETE FROM blocks WHERE height = $1",
+		"DELETE FROM account_txs WHERE height = ANY($1::bigint[])",
+		"DELETE FROM oracle_prices WHERE height = ANY($1::bigint[])",
+		"DELETE FROM blocks WHERE height = ANY($1::bigint[])",
 	} {
-		if _, err := tx.Exec(ctx, stmt, height); err != nil {
-			return fmt.Errorf("delete postgres block data at height %d: %w", height, err)
+		if _, err := tx.Exec(ctx, stmt, heightList); err != nil {
+			return fmt.Errorf("delete postgres block data at heights batch: %w", err)
 		}
 	}
 

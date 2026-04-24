@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/classic-terra/indexer-go/internal/model"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -329,6 +331,10 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tx.RawLog == "" || tx.LogsJSON == "" {
+		s.enrichTxLogsFromRPC(context.Background(), normalizedHash, &tx)
+	}
+
 	// Fetch Denoms
 	denoms, err := s.getDenoms(context.Background())
 	if err != nil {
@@ -342,6 +348,98 @@ func (s *Server) GetTx(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, s.MapTxToFCD(tx, denoms, msgTypes))
+}
+
+func (s *Server) enrichTxLogsFromRPC(ctx context.Context, hashHex string, tx *model.Tx) {
+	if s == nil || s.rpc == nil || tx == nil {
+		return
+	}
+	hashBytes, err := hex.DecodeString(hashHex)
+	if err != nil {
+		return
+	}
+
+	res, err := s.rpc.Tx(ctx, hashBytes, false)
+	if err != nil || res == nil {
+		return
+	}
+
+	// Post-SDK-upgrade: Log field is always empty; reconstruct logs from top-level events.
+	if tx.RawLog == "" && res.TxResult.Log != "" {
+		tx.RawLog = res.TxResult.Log
+	}
+
+	if tx.LogsJSON == "" && len(res.TxResult.Events) > 0 {
+		tx.LogsJSON = buildFCDLogsFromEvents(res.TxResult.Events)
+	}
+}
+
+// buildFCDLogsFromEvents converts ABCI events into an FCD-compatible logs JSON string.
+// Events with a msg_index attribute are grouped per message. Top-level events without
+// msg_index (fee deduction, tx-level events) are not included as they carry no message context.
+func buildFCDLogsFromEvents(events []abcitypes.Event) string {
+	type logAttr struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	type logEvent struct {
+		Type       string     `json:"type"`
+		Attributes []logAttr  `json:"attributes"`
+	}
+	type logEntry struct {
+		MsgIndex int        `json:"msg_index"`
+		Log      string     `json:"log"`
+		Events   []logEvent `json:"events"`
+	}
+
+	grouped := make(map[int][]logEvent)
+	maxIdx := -1
+
+	for _, ev := range events {
+		msgIdx := -1
+		for _, attr := range ev.Attributes {
+			if string(attr.Key) == "msg_index" {
+				if idx, err := strconv.Atoi(string(attr.Value)); err == nil {
+					msgIdx = idx
+				}
+				break
+			}
+		}
+		if msgIdx < 0 {
+			continue
+		}
+		if msgIdx > maxIdx {
+			maxIdx = msgIdx
+		}
+
+		attrs := make([]logAttr, 0, len(ev.Attributes))
+		for _, attr := range ev.Attributes {
+			if string(attr.Key) == "msg_index" {
+				continue
+			}
+			attrs = append(attrs, logAttr{Key: string(attr.Key), Value: string(attr.Value)})
+		}
+		grouped[msgIdx] = append(grouped[msgIdx], logEvent{Type: ev.Type, Attributes: attrs})
+	}
+
+	if maxIdx < 0 {
+		return ""
+	}
+
+	logs := make([]logEntry, maxIdx+1)
+	for i := 0; i <= maxIdx; i++ {
+		evs := grouped[i]
+		if evs == nil {
+			evs = []logEvent{}
+		}
+		logs[i] = logEntry{MsgIndex: i, Log: "", Events: evs}
+	}
+
+	b, err := json.Marshal(logs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func (s *Server) getDenoms(ctx context.Context) (map[uint16]string, error) {
