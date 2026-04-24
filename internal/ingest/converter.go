@@ -247,8 +247,8 @@ func buildLogsJSONFromEvents(events []abcitypes.Event) string {
 		Value string `json:"value"`
 	}
 	type logEvent struct {
-		Type       string     `json:"type"`
-		Attributes []logAttr  `json:"attributes"`
+		Type       string    `json:"type"`
+		Attributes []logAttr `json:"attributes"`
 	}
 	type logEntry struct {
 		MsgIndex int        `json:"msg_index"`

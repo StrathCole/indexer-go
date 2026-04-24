@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/classic-terra/indexer-go/internal/model"
@@ -14,6 +15,8 @@ type ReindexOptions struct {
 	DeleteTimeout      time.Duration
 	DeletePollInterval time.Duration
 	ProgressInterval   time.Duration
+	FetchWorkers       int
+	SkipAggregates     bool
 	DryRun             bool
 	Progress           func(format string, args ...any)
 }
@@ -28,6 +31,17 @@ type ReindexSummary struct {
 	OraclePriceCount int
 	ValidatorCount   int
 	BlockRewardCount int
+}
+
+type reindexBlockPayload struct {
+	height           uint64
+	block            model.Block
+	txs              []model.Tx
+	events           []model.Event
+	accountTxs       []model.AccountTx
+	oraclePrices     []model.OraclePrice
+	validatorReturns []model.ValidatorReturn
+	blockRewards     []model.BlockReward
 }
 
 var clickHouseHeightTables = []string{
@@ -59,6 +73,9 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 	if opts.ProgressInterval <= 0 {
 		opts.ProgressInterval = 10 * time.Second
 	}
+	if opts.FetchWorkers <= 0 {
+		opts.FetchWorkers = 1
+	}
 
 	opts.progressf("height %d: fetching and converting block", height)
 	block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(height)
@@ -85,12 +102,16 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 		return summary, nil
 	}
 
-	opts.progressf("height %d: loading aggregate refresh inputs", height)
-	affectedAddressIDs, affectedDays, err := s.reindexAggregateInputs(ctx, block.Height, block.BlockTime, accountTxs)
-	if err != nil {
-		return summary, err
+	var affectedAddressIDs []uint64
+	var affectedDays []string
+	if !opts.SkipAggregates {
+		opts.progressf("height %d: loading aggregate refresh inputs", height)
+		affectedAddressIDs, affectedDays, err = s.reindexAggregateInputs(ctx, block.Height, block.BlockTime, accountTxs)
+		if err != nil {
+			return summary, err
+		}
+		opts.progressf("height %d: aggregate refresh inputs loaded addresses=%d days=%d", height, len(affectedAddressIDs), len(affectedDays))
 	}
-	opts.progressf("height %d: aggregate refresh inputs loaded addresses=%d days=%d", height, len(affectedAddressIDs), len(affectedDays))
 
 	opts.progressf("height %d: deleting old rows", height)
 	if err := s.deleteBlockData(ctx, block.Height, opts); err != nil {
@@ -102,9 +123,11 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 		return summary, fmt.Errorf("insert reindexed height %d: %w", height, err)
 	}
 
-	opts.progressf("height %d: refreshing aggregates", height)
-	if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
-		return summary, err
+	if !opts.SkipAggregates {
+		opts.progressf("height %d: refreshing aggregates", height)
+		if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
+			return summary, err
+		}
 	}
 	opts.progressf("height %d: complete", height)
 
@@ -124,74 +147,115 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 	if opts.ProgressInterval <= 0 {
 		opts.ProgressInterval = 10 * time.Second
 	}
-
-	type reindexBlockPayload struct {
-		height           uint64
-		block            model.Block
-		txs              []model.Tx
-		events           []model.Event
-		accountTxs       []model.AccountTx
-		oraclePrices     []model.OraclePrice
-		validatorReturns []model.ValidatorReturn
-		blockRewards     []model.BlockReward
-		affectedDays     []string
-		affectedAddrIDs  []uint64
+	if opts.FetchWorkers <= 0 {
+		opts.FetchWorkers = 6
 	}
-
-	summaries := make([]ReindexSummary, 0, len(heights))
-	payloads := make([]reindexBlockPayload, 0, len(heights))
+	if opts.FetchWorkers > len(heights) {
+		opts.FetchWorkers = len(heights)
+	}
 
 	for _, h := range heights {
 		if h <= 0 {
 			return nil, fmt.Errorf("height must be > 0: %d", h)
 		}
+	}
 
-		opts.progressf("height %d: fetching and converting block", h)
-		block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(h)
-		if err != nil {
-			return nil, fmt.Errorf("fetch and convert height %d: %w", h, err)
-		}
-		if block.Height != uint64(h) {
-			return nil, fmt.Errorf("fetched height mismatch: requested %d, got %d", h, block.Height)
-		}
+	type fetchJob struct {
+		idx    int
+		height int64
+	}
+	type fetchResult struct {
+		idx     int
+		summary ReindexSummary
+		payload reindexBlockPayload
+		err     error
+	}
 
-		summary := ReindexSummary{
-			Height:           block.Height,
-			TxCount:          len(txs),
-			EventCount:       len(events),
-			TxEventCount:     countEventsByScope(events, "tx"),
-			BlockEventCount:  countNonTxEvents(events),
-			AccountTxCount:   len(accountTxs),
-			OraclePriceCount: len(oraclePrices),
-			ValidatorCount:   len(validatorReturns),
-			BlockRewardCount: len(blockRewards),
-		}
-		summaries = append(summaries, summary)
+	jobs := make(chan fetchJob, len(heights))
+	results := make(chan fetchResult, len(heights))
 
-		opts.progressf("height %d: fetched txs=%d events=%d block_events=%d tx_events=%d account_txs=%d", h, summary.TxCount, summary.EventCount, summary.BlockEventCount, summary.TxEventCount, summary.AccountTxCount)
-		if opts.DryRun {
+	for idx, h := range heights {
+		jobs <- fetchJob{idx: idx, height: h}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < opts.FetchWorkers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				opts.progressf("height %d: fetching and converting block", job.height)
+				block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(job.height)
+				if err != nil {
+					results <- fetchResult{idx: job.idx, err: fmt.Errorf("fetch and convert height %d: %w", job.height, err)}
+					continue
+				}
+				if block.Height != uint64(job.height) {
+					results <- fetchResult{idx: job.idx, err: fmt.Errorf("fetched height mismatch: requested %d, got %d", job.height, block.Height)}
+					continue
+				}
+
+				summary := ReindexSummary{
+					Height:           block.Height,
+					TxCount:          len(txs),
+					EventCount:       len(events),
+					TxEventCount:     countEventsByScope(events, "tx"),
+					BlockEventCount:  countNonTxEvents(events),
+					AccountTxCount:   len(accountTxs),
+					OraclePriceCount: len(oraclePrices),
+					ValidatorCount:   len(validatorReturns),
+					BlockRewardCount: len(blockRewards),
+				}
+				opts.progressf("height %d: fetched txs=%d events=%d block_events=%d tx_events=%d account_txs=%d", job.height, summary.TxCount, summary.EventCount, summary.BlockEventCount, summary.TxEventCount, summary.AccountTxCount)
+
+				results <- fetchResult{
+					idx:     job.idx,
+					summary: summary,
+					payload: reindexBlockPayload{
+						height:           block.Height,
+						block:            block,
+						txs:              txs,
+						events:           events,
+						accountTxs:       accountTxs,
+						oraclePrices:     oraclePrices,
+						validatorReturns: validatorReturns,
+						blockRewards:     blockRewards,
+					},
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	summariesByIdx := make([]ReindexSummary, len(heights))
+	payloadsByIdx := make([]reindexBlockPayload, len(heights))
+	var fetchErr error
+	for result := range results {
+		if result.err != nil {
+			if fetchErr == nil {
+				fetchErr = result.err
+			}
 			continue
 		}
+		summariesByIdx[result.idx] = result.summary
+		payloadsByIdx[result.idx] = result.payload
+	}
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
 
-		opts.progressf("height %d: loading aggregate refresh inputs", h)
-		affectedAddressIDs, affectedDays, err := s.reindexAggregateInputs(ctx, block.Height, block.BlockTime, accountTxs)
-		if err != nil {
-			return nil, err
+	summaries := make([]ReindexSummary, 0, len(heights))
+	payloads := make([]reindexBlockPayload, 0, len(heights))
+	for i := range heights {
+		summaries = append(summaries, summariesByIdx[i])
+		if !opts.DryRun {
+			payloads = append(payloads, payloadsByIdx[i])
 		}
-		opts.progressf("height %d: aggregate refresh inputs loaded addresses=%d days=%d", h, len(affectedAddressIDs), len(affectedDays))
-
-		payloads = append(payloads, reindexBlockPayload{
-			height:           block.Height,
-			block:            block,
-			txs:              txs,
-			events:           events,
-			accountTxs:       accountTxs,
-			oraclePrices:     oraclePrices,
-			validatorReturns: validatorReturns,
-			blockRewards:     blockRewards,
-			affectedDays:     affectedDays,
-			affectedAddrIDs:  affectedAddressIDs,
-		})
 	}
 
 	if opts.DryRun {
@@ -212,11 +276,10 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 
 	for _, payload := range payloads {
 		heightSet[payload.height] = struct{}{}
-		for _, day := range payload.affectedDays {
-			affectedDaySet[day] = struct{}{}
-		}
-		for _, id := range payload.affectedAddrIDs {
-			affectedAddressSet[id] = struct{}{}
+		affectedDaySet[sqlDay(payload.block.BlockTime)] = struct{}{}
+		for _, at := range payload.accountTxs {
+			affectedAddressSet[at.AddressID] = struct{}{}
+			affectedDaySet[sqlDay(at.BlockTime)] = struct{}{}
 		}
 
 		allBlocks = append(allBlocks, payload.block)
@@ -229,6 +292,22 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 	}
 
 	batchHeights := sortedUint64Keys(heightSet)
+
+	if !opts.SkipAggregates {
+		existingAddressIDs, existingDays, err := s.reindexExistingAggregateInputsBatch(ctx, batchHeights)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range existingAddressIDs {
+			affectedAddressSet[id] = struct{}{}
+		}
+		for _, day := range existingDays {
+			if day != "" {
+				affectedDaySet[day] = struct{}{}
+			}
+		}
+	}
+
 	affectedDays := sortedStringKeys(affectedDaySet)
 	affectedAddressIDs := sortedUint64Keys(affectedAddressSet)
 
@@ -242,9 +321,11 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 		return nil, fmt.Errorf("insert reindexed heights batch: %w", err)
 	}
 
-	opts.progressf("batch: refreshing aggregates for addresses=%d days=%d", len(affectedAddressIDs), len(affectedDays))
-	if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
-		return nil, err
+	if !opts.SkipAggregates {
+		opts.progressf("batch: refreshing aggregates for addresses=%d days=%d", len(affectedAddressIDs), len(affectedDays))
+		if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, summary := range summaries {
@@ -399,6 +480,34 @@ func (s *Service) reindexAggregateInputs(ctx context.Context, height uint64, blo
 	}
 
 	return sortedUint64Keys(addressIDs), sortedStringKeys(days), nil
+}
+
+func (s *Service) reindexExistingAggregateInputsBatch(ctx context.Context, heights []uint64) ([]uint64, []string, error) {
+	if len(heights) == 0 {
+		return nil, nil, nil
+	}
+
+	exists, err := s.clickHouseTableExists(ctx, "account_txs")
+	if err != nil {
+		return nil, nil, fmt.Errorf("check ClickHouse account_txs: %w", err)
+	}
+	if !exists {
+		return nil, nil, nil
+	}
+
+	heightFilter := "height IN (" + joinUint64s(heights) + ")"
+
+	addressIDs, err := s.queryClickHouseUint64Column(ctx, "SELECT DISTINCT address_id FROM account_txs WHERE "+heightFilter)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load existing account_txs address ids for heights batch: %w", err)
+	}
+
+	days, err := s.queryClickHouseStringColumn(ctx, "SELECT DISTINCT toString(toDate(block_time)) FROM account_txs WHERE "+heightFilter)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load existing account_txs days for heights batch: %w", err)
+	}
+
+	return addressIDs, days, nil
 }
 
 func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uint64, days []string, opts ReindexOptions) error {

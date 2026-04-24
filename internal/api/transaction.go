@@ -2,8 +2,8 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	abcitypes "github.com/cometbft/cometbft/abci/types"
 	"github.com/classic-terra/indexer-go/internal/model"
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
@@ -383,8 +383,8 @@ func buildFCDLogsFromEvents(events []abcitypes.Event) string {
 		Value string `json:"value"`
 	}
 	type logEvent struct {
-		Type       string     `json:"type"`
-		Attributes []logAttr  `json:"attributes"`
+		Type       string    `json:"type"`
+		Attributes []logAttr `json:"attributes"`
 	}
 	type logEntry struct {
 		MsgIndex int        `json:"msg_index"`

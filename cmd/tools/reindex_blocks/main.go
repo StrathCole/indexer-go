@@ -28,6 +28,8 @@ func main() {
 	deletePollInterval := flag.Duration("delete-poll-interval", 2*time.Second, "Polling interval while waiting for ClickHouse deletes")
 	progressInterval := flag.Duration("progress-interval", 10*time.Second, "How often to log long-running reindex sub-steps")
 	batchSize := flag.Int("batch-size", 100, "Number of heights to reindex per batch (1 = legacy per-height mode)")
+	fetchWorkers := flag.Int("fetch-workers", 6, "Number of concurrent block fetch/convert workers per chunk")
+	skipAggregates := flag.Bool("skip-aggregates", false, "Skip aggregate-table refresh during reindex (faster catch-up; aggregates can be rebuilt later)")
 	dryRun := flag.Bool("dry-run", false, "Fetch and convert target blocks, but do not delete or insert")
 	continueOnError := flag.Bool("continue-on-error", true, "Continue reindexing remaining heights after an error")
 	flag.Parse()
@@ -50,6 +52,9 @@ func main() {
 	}
 	if *batchSize <= 0 {
 		log.Fatalf("--batch-size must be > 0")
+	}
+	if *fetchWorkers <= 0 {
+		log.Fatalf("--fetch-workers must be > 0")
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -91,6 +96,7 @@ func main() {
 	}
 
 	log.Printf("Reindexing %d block(s), dry_run=%t", len(targetHeights), *dryRun)
+	log.Printf("Reindex settings: batch_size=%d fetch_workers=%d skip_aggregates=%t", *batchSize, *fetchWorkers, *skipAggregates)
 	if !*dryRun {
 		log.Printf("Pause live ingest while this runs; reindex deletes height-scoped rows before reinserting fresh data.")
 	}
@@ -113,6 +119,8 @@ func main() {
 			DeleteTimeout:      *deleteTimeout,
 			DeletePollInterval: *deletePollInterval,
 			ProgressInterval:   *progressInterval,
+			FetchWorkers:       *fetchWorkers,
+			SkipAggregates:     *skipAggregates,
 			DryRun:             *dryRun,
 			Progress:           log.Printf,
 		})
@@ -128,6 +136,8 @@ func main() {
 					DeleteTimeout:      *deleteTimeout,
 					DeletePollInterval: *deletePollInterval,
 					ProgressInterval:   *progressInterval,
+					FetchWorkers:       *fetchWorkers,
+					SkipAggregates:     *skipAggregates,
 					DryRun:             *dryRun,
 					Progress:           log.Printf,
 				})
