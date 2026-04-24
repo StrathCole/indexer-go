@@ -20,6 +20,8 @@ type ReindexSummary struct {
 	Height           uint64
 	TxCount          int
 	EventCount       int
+	TxEventCount     int
+	BlockEventCount  int
 	AccountTxCount   int
 	OraclePriceCount int
 	ValidatorCount   int
@@ -60,6 +62,8 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 		Height:           block.Height,
 		TxCount:          len(txs),
 		EventCount:       len(events),
+		TxEventCount:     countEventsByScope(events, "tx"),
+		BlockEventCount:  countNonTxEvents(events),
 		AccountTxCount:   len(accountTxs),
 		OraclePriceCount: len(oraclePrices),
 		ValidatorCount:   len(validatorReturns),
@@ -87,6 +91,26 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 	}
 
 	return summary, nil
+}
+
+func countEventsByScope(events []model.Event, scope string) int {
+	var count int
+	for _, event := range events {
+		if event.Scope == scope {
+			count++
+		}
+	}
+	return count
+}
+
+func countNonTxEvents(events []model.Event) int {
+	var count int
+	for _, event := range events {
+		if event.Scope != "tx" {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Service) deleteBlockData(ctx context.Context, height uint64, timeout time.Duration, pollInterval time.Duration) error {

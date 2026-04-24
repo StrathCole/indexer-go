@@ -90,8 +90,11 @@ func main() {
 	ctx := context.Background()
 	var succeeded int
 	var failed int
-	for _, h := range targetHeights {
+	runStarted := time.Now()
+	total := len(targetHeights)
+	for i, h := range targetHeights {
 		started := time.Now()
+		log.Printf("Progress %d/%d (%.1f%%): reindexing height %d", i+1, total, percent(i, total), h)
 		summary, err := svc.ReindexBlock(ctx, h, ingest.ReindexOptions{
 			DeleteTimeout:      *deleteTimeout,
 			DeletePollInterval: *deletePollInterval,
@@ -107,12 +110,21 @@ func main() {
 		}
 
 		succeeded++
+		processed := i + 1
+		avg := time.Since(runStarted) / time.Duration(processed)
+		eta := avg * time.Duration(total-processed)
 		log.Printf(
-			"Height %d reindexed in %s: txs=%d events=%d account_txs=%d oracle_prices=%d validator_returns=%d block_rewards=%d",
+			"Progress %d/%d (%.1f%%): height %d reindexed in %s, eta=%s, txs=%d events=%d block_events=%d tx_events=%d account_txs=%d oracle_prices=%d validator_returns=%d block_rewards=%d",
+			processed,
+			total,
+			percent(processed, total),
 			summary.Height,
 			time.Since(started),
+			eta.Round(time.Second),
 			summary.TxCount,
 			summary.EventCount,
+			summary.BlockEventCount,
+			summary.TxEventCount,
 			summary.AccountTxCount,
 			summary.OraclePriceCount,
 			summary.ValidatorCount,
@@ -233,4 +245,11 @@ func uniqSortedHeights(heights []int64) []int64 {
 		}
 	}
 	return out
+}
+
+func percent(done int, total int) float64 {
+	if total == 0 {
+		return 100
+	}
+	return float64(done) * 100 / float64(total)
 }

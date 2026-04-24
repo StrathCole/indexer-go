@@ -3,8 +3,10 @@ package ingest
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -22,6 +24,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
 
 	// We might need to use the CometBFT RPC client for blocks if gRPC doesn't provide everything
@@ -207,6 +210,108 @@ func (s *Service) reconnectRPC() error {
 	s.rpcVal.Store(rpcClient)
 	s.clientCtx = s.clientCtx.WithClient(rpcClient)
 	return nil
+}
+
+type blockResultEvents struct {
+	begin []abcitypes.Event
+	end   []abcitypes.Event
+}
+
+type rawBlockResultsResponse struct {
+	Result rawBlockResults `json:"result"`
+}
+
+type rawBlockResults struct {
+	BeginBlockEvents    []abcitypes.Event `json:"begin_block_events"`
+	EndBlockEvents      []abcitypes.Event `json:"end_block_events"`
+	FinalizeBlockEvents []abcitypes.Event `json:"finalize_block_events"`
+}
+
+func (s *Service) blockResultEvents(ctx context.Context, height int64, results *coretypes.ResultBlockResults) blockResultEvents {
+	if results != nil && len(results.FinalizeBlockEvents) > 0 {
+		return splitFinalizeBlockEvents(results.FinalizeBlockEvents)
+	}
+
+	raw, err := s.fetchRawBlockResultEvents(ctx, height)
+	if err != nil {
+		log.Printf("Height %d: failed to fetch raw block result events: %v", height, err)
+		return blockResultEvents{}
+	}
+
+	if len(raw.BeginBlockEvents) > 0 {
+		return blockResultEvents{
+			begin: raw.BeginBlockEvents,
+			end:   raw.EndBlockEvents,
+		}
+	}
+	if len(raw.EndBlockEvents) > 0 {
+		return blockResultEvents{
+			end: raw.EndBlockEvents,
+		}
+	}
+	if len(raw.FinalizeBlockEvents) > 0 {
+		return splitFinalizeBlockEvents(raw.FinalizeBlockEvents)
+	}
+	if results != nil && len(results.FinalizeBlockEvents) > 0 {
+		return splitFinalizeBlockEvents(results.FinalizeBlockEvents)
+	}
+
+	return blockResultEvents{}
+}
+
+func (s *Service) fetchRawBlockResultEvents(ctx context.Context, height int64) (rawBlockResults, error) {
+	base, err := url.Parse(s.nodeRPC)
+	if err != nil {
+		return rawBlockResults{}, err
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/block_results"
+	q := base.Query()
+	q.Set("height", fmt.Sprintf("%d", height))
+	base.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	if err != nil {
+		return rawBlockResults{}, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return rawBlockResults{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return rawBlockResults{}, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var out rawBlockResultsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return rawBlockResults{}, err
+	}
+	return out.Result, nil
+}
+
+func splitFinalizeBlockEvents(events []abcitypes.Event) blockResultEvents {
+	var out blockResultEvents
+	for _, event := range events {
+		mode := strings.ToLower(blockEventMode(event))
+		switch mode {
+		case "beginblock", "begin_block":
+			out.begin = append(out.begin, event)
+		default:
+			out.end = append(out.end, event)
+		}
+	}
+	return out
+}
+
+func blockEventMode(event abcitypes.Event) string {
+	for _, attr := range event.Attributes {
+		if attr.Key == "mode" {
+			return attr.Value
+		}
+	}
+	return ""
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -665,14 +770,15 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	txDecoder := s.txDecoder
 
 	modelBlock := s.convertBlock(block)
+	blockEvents := s.blockResultEvents(context.Background(), height, results)
+	allBlockEvents := append(append([]abcitypes.Event{}, blockEvents.begin...), blockEvents.end...)
 
 	oraclePrices := s.extractOraclePrices(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		results.FinalizeBlockEvents,
+		allBlockEvents,
 	)
 
-	allBlockEvents := results.FinalizeBlockEvents
 	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -683,26 +789,46 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
 
-	finalizeBlockEvents := s.convertBlockEvents(
+	beginBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		blockEvents.begin,
+	)
+	modelEvents = append(modelEvents, beginBlockEvents...)
+
+	endBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
 		"end_block",
-		results.FinalizeBlockEvents,
+		blockEvents.end,
 	)
+	modelEvents = append(modelEvents, endBlockEvents...)
 
-	modelEvents = append(modelEvents, finalizeBlockEvents...)
+	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		blockEvents.begin,
+	)
+	if err != nil {
+		log.Printf("Failed to extract begin_block account relations: %v", err)
+	} else {
+		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
+	}
 
-	finalizeBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
 		"end_block",
-		results.FinalizeBlockEvents,
+		blockEvents.end,
 	)
 	if err != nil {
-		log.Printf("Failed to extract finalize_block account relations: %v", err)
+		log.Printf("Failed to extract end_block account relations: %v", err)
 	} else {
-		modelAccountTxs = append(modelAccountTxs, finalizeBlockAccountTxs...)
+		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
 	}
 
 	for i, txBytes := range block.Block.Txs {
@@ -792,16 +918,17 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 
 	// Convert Block
 	modelBlock := s.convertBlock(block)
+	blockEvents := s.blockResultEvents(context.Background(), block.Block.Height, results)
+	allBlockEvents := append(append([]abcitypes.Event{}, blockEvents.begin...), blockEvents.end...)
 
 	// Extract Oracle Prices from FinalizeBlock events
 	oraclePrices := s.extractOraclePrices(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		results.FinalizeBlockEvents,
+		allBlockEvents,
 	)
 
 	// Extract Block Rewards and Validator Returns
-	allBlockEvents := results.FinalizeBlockEvents
 	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -814,27 +941,47 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var newAccountsTx uint64
 
 	// Convert Block Events (FinalizeBlock)
-	finalizeBlockEvents := s.convertBlockEvents(
+	beginBlockEvents := s.convertBlockEvents(
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		blockEvents.begin,
+	)
+	modelEvents = append(modelEvents, beginBlockEvents...)
+
+	endBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
 		"end_block",
-		results.FinalizeBlockEvents,
+		blockEvents.end,
 	)
+	modelEvents = append(modelEvents, endBlockEvents...)
 
-	modelEvents = append(modelEvents, finalizeBlockEvents...)
+	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+		context.Background(),
+		uint64(block.Block.Height),
+		block.Block.Time,
+		"begin_block",
+		blockEvents.begin,
+	)
+	if err != nil {
+		log.Printf("Failed to extract begin_block account relations: %v", err)
+	} else {
+		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
+	}
 
 	// Extract account activity from block events (stored in account_txs with special index values)
-	finalizeBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
 		"end_block",
-		results.FinalizeBlockEvents,
+		blockEvents.end,
 	)
 	if err != nil {
-		log.Printf("Failed to extract finalize_block account relations: %v", err)
+		log.Printf("Failed to extract end_block account relations: %v", err)
 	} else {
-		modelAccountTxs = append(modelAccountTxs, finalizeBlockAccountTxs...)
+		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
 	}
 
 	for i, txBytes := range block.Block.Txs {
