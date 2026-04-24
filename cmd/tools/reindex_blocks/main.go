@@ -26,6 +26,7 @@ func main() {
 	heightsFile := flag.String("heights-file", "", "File containing block heights to reindex, one per line")
 	deleteTimeout := flag.Duration("delete-timeout", 15*time.Minute, "Timeout for each ClickHouse delete mutation")
 	deletePollInterval := flag.Duration("delete-poll-interval", 2*time.Second, "Polling interval while waiting for ClickHouse deletes")
+	progressInterval := flag.Duration("progress-interval", 10*time.Second, "How often to log long-running reindex sub-steps")
 	dryRun := flag.Bool("dry-run", false, "Fetch and convert target blocks, but do not delete or insert")
 	continueOnError := flag.Bool("continue-on-error", true, "Continue reindexing remaining heights after an error")
 	flag.Parse()
@@ -42,6 +43,9 @@ func main() {
 	}
 	if *deletePollInterval <= 0 {
 		log.Fatalf("--delete-poll-interval must be > 0")
+	}
+	if *progressInterval <= 0 {
+		log.Fatalf("--progress-interval must be > 0")
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -98,7 +102,9 @@ func main() {
 		summary, err := svc.ReindexBlock(ctx, h, ingest.ReindexOptions{
 			DeleteTimeout:      *deleteTimeout,
 			DeletePollInterval: *deletePollInterval,
+			ProgressInterval:   *progressInterval,
 			DryRun:             *dryRun,
+			Progress:           log.Printf,
 		})
 		if err != nil {
 			failed++

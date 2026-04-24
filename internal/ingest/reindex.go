@@ -13,7 +13,9 @@ import (
 type ReindexOptions struct {
 	DeleteTimeout      time.Duration
 	DeletePollInterval time.Duration
+	ProgressInterval   time.Duration
 	DryRun             bool
+	Progress           func(format string, args ...any)
 }
 
 type ReindexSummary struct {
@@ -49,7 +51,11 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 	if opts.DeletePollInterval <= 0 {
 		opts.DeletePollInterval = 2 * time.Second
 	}
+	if opts.ProgressInterval <= 0 {
+		opts.ProgressInterval = 10 * time.Second
+	}
 
+	opts.progressf("height %d: fetching and converting block", height)
 	block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(height)
 	if err != nil {
 		return ReindexSummary{}, fmt.Errorf("fetch and convert height %d: %w", height, err)
@@ -69,28 +75,41 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 		ValidatorCount:   len(validatorReturns),
 		BlockRewardCount: len(blockRewards),
 	}
+	opts.progressf("height %d: fetched txs=%d events=%d block_events=%d tx_events=%d account_txs=%d", height, summary.TxCount, summary.EventCount, summary.BlockEventCount, summary.TxEventCount, summary.AccountTxCount)
 	if opts.DryRun {
 		return summary, nil
 	}
 
+	opts.progressf("height %d: loading aggregate refresh inputs", height)
 	affectedAddressIDs, affectedDays, err := s.reindexAggregateInputs(ctx, block.Height, block.BlockTime, accountTxs)
 	if err != nil {
 		return summary, err
 	}
+	opts.progressf("height %d: aggregate refresh inputs loaded addresses=%d days=%d", height, len(affectedAddressIDs), len(affectedDays))
 
-	if err := s.deleteBlockData(ctx, block.Height, opts.DeleteTimeout, opts.DeletePollInterval); err != nil {
+	opts.progressf("height %d: deleting old rows", height)
+	if err := s.deleteBlockData(ctx, block.Height, opts); err != nil {
 		return summary, err
 	}
 
+	opts.progressf("height %d: inserting fresh rows", height)
 	if err := s.BatchInsert(ctx, []model.Block{block}, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards); err != nil {
 		return summary, fmt.Errorf("insert reindexed height %d: %w", height, err)
 	}
 
-	if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts.DeleteTimeout, opts.DeletePollInterval); err != nil {
+	opts.progressf("height %d: refreshing aggregates", height)
+	if err := s.refreshReindexAggregates(ctx, affectedAddressIDs, affectedDays, opts); err != nil {
 		return summary, err
 	}
+	opts.progressf("height %d: complete", height)
 
 	return summary, nil
+}
+
+func (opts ReindexOptions) progressf(format string, args ...any) {
+	if opts.Progress != nil {
+		opts.Progress(format, args...)
+	}
 }
 
 func countEventsByScope(events []model.Event, scope string) int {
@@ -113,39 +132,50 @@ func countNonTxEvents(events []model.Event) int {
 	return count
 }
 
-func (s *Service) deleteBlockData(ctx context.Context, height uint64, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) deleteBlockData(ctx context.Context, height uint64, opts ReindexOptions) error {
 	for _, table := range clickHouseHeightTables {
+		opts.progressf("height %d: checking ClickHouse table %s", height, table)
 		exists, err := s.clickHouseTableExists(ctx, table)
 		if err != nil {
 			return fmt.Errorf("check ClickHouse table %s: %w", table, err)
 		}
 		if !exists {
+			opts.progressf("height %d: ClickHouse table %s missing, skipping", height, table)
 			continue
 		}
-		if err := s.deleteClickHouseHeight(ctx, table, height, timeout, pollInterval); err != nil {
+		if err := s.deleteClickHouseHeight(ctx, table, height, opts); err != nil {
 			return err
 		}
 	}
 
+	opts.progressf("height %d: deleting PostgreSQL rows", height)
 	if err := s.pg.DeleteBlockData(ctx, height); err != nil {
 		return err
 	}
+	opts.progressf("height %d: PostgreSQL rows deleted", height)
 	return nil
 }
 
-func (s *Service) deleteClickHouseHeight(ctx context.Context, table string, height uint64, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) deleteClickHouseHeight(ctx context.Context, table string, height uint64, opts ReindexOptions) error {
+	opts.progressf("height %d: deleting ClickHouse %s rows", height, table)
 	if err := s.ch.Conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DELETE WHERE height = %d", table, height)); err != nil {
 		return fmt.Errorf("delete ClickHouse %s height %d: %w", table, height, err)
 	}
 
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(opts.DeleteTimeout)
+	lastProgress := time.Now()
 	for {
 		remaining, err := s.countClickHouseHeightRows(ctx, table, height)
 		if err != nil {
 			return fmt.Errorf("count ClickHouse %s height %d after delete: %w", table, height, err)
 		}
 		if remaining == 0 {
+			opts.progressf("height %d: ClickHouse %s delete complete", height, table)
 			return nil
+		}
+		if time.Since(lastProgress) >= opts.ProgressInterval {
+			opts.progressf("height %d: waiting for ClickHouse %s delete, remaining_rows=%d", height, table, remaining)
+			lastProgress = time.Now()
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for ClickHouse delete on %s height %d; %d rows still visible", table, height, remaining)
@@ -154,7 +184,7 @@ func (s *Service) deleteClickHouseHeight(ctx context.Context, table string, heig
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(opts.DeletePollInterval):
 		}
 	}
 }
@@ -211,13 +241,14 @@ func (s *Service) reindexAggregateInputs(ctx context.Context, height uint64, blo
 	return sortedUint64Keys(addressIDs), sortedStringKeys(days), nil
 }
 
-func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uint64, days []string, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uint64, days []string, opts ReindexOptions) error {
 	registeredDaySet := make(map[string]struct{}, len(days))
 	for _, day := range days {
 		registeredDaySet[day] = struct{}{}
 	}
 
 	if len(addressIDs) > 0 {
+		opts.progressf("aggregates: collecting old first-seen days for %d addresses", len(addressIDs))
 		oldFirstSeenDays, err := s.collectAddressFirstSeenDays(ctx, addressIDs)
 		if err != nil {
 			return err
@@ -228,18 +259,19 @@ func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uin
 	}
 
 	if len(days) > 0 {
-		if err := s.refreshDailyActiveTx(ctx, days, timeout, pollInterval); err != nil {
+		if err := s.refreshDailyActiveTx(ctx, days, opts); err != nil {
 			return err
 		}
 	}
 
 	if len(addressIDs) > 0 {
-		if err := s.refreshAddressFirstSeenTx(ctx, addressIDs, timeout, pollInterval); err != nil {
+		if err := s.refreshAddressFirstSeenTx(ctx, addressIDs, opts); err != nil {
 			return err
 		}
 	}
 
 	if len(addressIDs) > 0 {
+		opts.progressf("aggregates: collecting new first-seen days for %d addresses", len(addressIDs))
 		newFirstSeenDays, err := s.collectAddressFirstSeenDays(ctx, addressIDs)
 		if err != nil {
 			return err
@@ -251,7 +283,7 @@ func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uin
 
 	registeredDays := sortedStringKeys(registeredDaySet)
 	if len(registeredDays) > 0 {
-		if err := s.refreshRegisteredAccountsDailyTx(ctx, registeredDays, timeout, pollInterval); err != nil {
+		if err := s.refreshRegisteredAccountsDailyTx(ctx, registeredDays, opts); err != nil {
 			return err
 		}
 	}
@@ -259,7 +291,7 @@ func (s *Service) refreshReindexAggregates(ctx context.Context, addressIDs []uin
 	return nil
 }
 
-func (s *Service) refreshDailyActiveTx(ctx context.Context, days []string, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) refreshDailyActiveTx(ctx context.Context, days []string, opts ReindexOptions) error {
 	exists, err := s.clickHouseTableExists(ctx, "account_txs_daily_active_tx")
 	if err != nil {
 		return fmt.Errorf("check ClickHouse account_txs_daily_active_tx: %w", err)
@@ -269,8 +301,9 @@ func (s *Service) refreshDailyActiveTx(ctx context.Context, days []string, timeo
 	}
 
 	for _, day := range days {
+		opts.progressf("aggregates: refreshing account_txs_daily_active_tx for %s", day)
 		where := fmt.Sprintf("day = toDate('%s')", day)
-		if err := s.deleteClickHouseWhere(ctx, "account_txs_daily_active_tx", where, timeout, pollInterval); err != nil {
+		if err := s.deleteClickHouseWhere(ctx, "account_txs_daily_active_tx", where, opts); err != nil {
 			return err
 		}
 
@@ -287,7 +320,7 @@ GROUP BY day`, day)
 	return nil
 }
 
-func (s *Service) refreshAddressFirstSeenTx(ctx context.Context, addressIDs []uint64, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) refreshAddressFirstSeenTx(ctx context.Context, addressIDs []uint64, opts ReindexOptions) error {
 	exists, err := s.clickHouseTableExists(ctx, "address_first_seen_tx")
 	if err != nil {
 		return fmt.Errorf("check ClickHouse address_first_seen_tx: %w", err)
@@ -296,9 +329,11 @@ func (s *Service) refreshAddressFirstSeenTx(ctx context.Context, addressIDs []ui
 		return nil
 	}
 
-	for _, chunk := range chunkUint64s(addressIDs, 5000) {
+	chunks := chunkUint64s(addressIDs, 5000)
+	for i, chunk := range chunks {
+		opts.progressf("aggregates: refreshing address_first_seen_tx chunk %d/%d addresses=%d", i+1, len(chunks), len(chunk))
 		ids := joinUint64s(chunk)
-		if err := s.deleteClickHouseWhere(ctx, "address_first_seen_tx", "address_id IN ("+ids+")", timeout, pollInterval); err != nil {
+		if err := s.deleteClickHouseWhere(ctx, "address_first_seen_tx", "address_id IN ("+ids+")", opts); err != nil {
 			return err
 		}
 
@@ -390,7 +425,7 @@ func (s *Service) queryClickHouseStringColumn(ctx context.Context, query string)
 	return out, nil
 }
 
-func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []string, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []string, opts ReindexOptions) error {
 	exists, err := s.clickHouseTableExists(ctx, "registered_accounts_daily_tx")
 	if err != nil {
 		return fmt.Errorf("check ClickHouse registered_accounts_daily_tx: %w", err)
@@ -400,8 +435,9 @@ func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []s
 	}
 
 	for _, day := range days {
+		opts.progressf("aggregates: refreshing registered_accounts_daily_tx for %s", day)
 		where := fmt.Sprintf("day = toDate('%s')", day)
-		if err := s.deleteClickHouseWhere(ctx, "registered_accounts_daily_tx", where, timeout, pollInterval); err != nil {
+		if err := s.deleteClickHouseWhere(ctx, "registered_accounts_daily_tx", where, opts); err != nil {
 			return err
 		}
 
@@ -422,19 +458,26 @@ GROUP BY first_seen_day`, day)
 	return nil
 }
 
-func (s *Service) deleteClickHouseWhere(ctx context.Context, table string, where string, timeout time.Duration, pollInterval time.Duration) error {
+func (s *Service) deleteClickHouseWhere(ctx context.Context, table string, where string, opts ReindexOptions) error {
+	opts.progressf("ClickHouse %s: deleting rows where %s", table, where)
 	if err := s.ch.Conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DELETE WHERE %s", table, where)); err != nil {
 		return fmt.Errorf("delete ClickHouse %s where %s: %w", table, where, err)
 	}
 
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(opts.DeleteTimeout)
+	lastProgress := time.Now()
 	for {
 		var remaining uint64
 		if err := s.ch.Conn.QueryRow(ctx, fmt.Sprintf("SELECT count() FROM %s WHERE %s", table, where)).Scan(&remaining); err != nil {
 			return fmt.Errorf("count ClickHouse %s where %s after delete: %w", table, where, err)
 		}
 		if remaining == 0 {
+			opts.progressf("ClickHouse %s: delete complete where %s", table, where)
 			return nil
+		}
+		if time.Since(lastProgress) >= opts.ProgressInterval {
+			opts.progressf("ClickHouse %s: waiting for delete, remaining_rows=%d where %s", table, remaining, where)
+			lastProgress = time.Now()
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for ClickHouse delete on %s where %s; %d rows still visible", table, where, remaining)
@@ -443,7 +486,7 @@ func (s *Service) deleteClickHouseWhere(ctx context.Context, table string, where
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(opts.DeletePollInterval):
 		}
 	}
 }

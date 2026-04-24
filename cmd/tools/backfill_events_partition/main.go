@@ -22,6 +22,7 @@ import (
 	"github.com/classic-terra/core/v4/app"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
+	abcitypes "github.com/cometbft/cometbft/abci/types"
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	coretypes "github.com/cometbft/cometbft/rpc/core/types"
 	tmtypes "github.com/cometbft/cometbft/types"
@@ -144,11 +145,12 @@ func extractEventsFromBlock(height uint64, blockTime time.Time, blockTxs tmtypes
 	var out []model.Event
 
 	for i, event := range results.FinalizeBlockEvents {
+		scope := blockEventScope(event)
 		for _, attr := range event.Attributes {
 			out = append(out, model.Event{
 				Height:     height,
 				BlockTime:  blockTime,
-				Scope:      "end_block",
+				Scope:      scope,
 				TxIndex:    -1,
 				EventIndex: uint16(i),
 				EventType:  event.Type,
@@ -191,6 +193,19 @@ func extractEventsFromBlock(height uint64, blockTime time.Time, blockTxs tmtypes
 	}
 
 	return out
+}
+
+func blockEventScope(event abcitypes.Event) string {
+	for _, attr := range event.Attributes {
+		if attr.Key != "mode" {
+			continue
+		}
+		switch strings.ToLower(attr.Value) {
+		case "beginblock", "begin_block":
+			return "begin_block"
+		}
+	}
+	return "end_block"
 }
 
 func insertEvents(ctx context.Context, ch *db.ClickHouse, events []model.Event) error {
