@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
 	"cosmossdk.io/math"
+	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/bech32"

@@ -66,7 +66,7 @@ func main() {
 		minHeight = uint64(*startHeight)
 	} else {
 		// Get min height from events
-		err := ch.Conn.QueryRow(ctx, "SELECT min(height) FROM events WHERE scope IN ('begin_block', 'end_block', 'block')").Scan(&minHeight)
+		err := ch.Conn.QueryRow(ctx, "SELECT min(height) FROM events WHERE scope IN ('begin_block', 'end_block', 'finalize_block', 'block')").Scan(&minHeight)
 		if err != nil {
 			log.Fatalf("Failed to get min height: %v", err)
 		}
@@ -76,7 +76,7 @@ func main() {
 		maxHeight = uint64(*endHeight)
 	} else {
 		// Get max height from events
-		err := ch.Conn.QueryRow(ctx, "SELECT max(height) FROM events WHERE scope IN ('begin_block', 'end_block', 'block')").Scan(&maxHeight)
+		err := ch.Conn.QueryRow(ctx, "SELECT max(height) FROM events WHERE scope IN ('begin_block', 'end_block', 'finalize_block', 'block')").Scan(&maxHeight)
 		if err != nil {
 			log.Fatalf("Failed to get max height: %v", err)
 		}
@@ -216,7 +216,7 @@ func main() {
 			SELECT height, block_time, scope, attr_key, attr_value
 			FROM events
 			WHERE height >= $1 AND height <= $2
-			  AND scope IN ('begin_block', 'end_block', 'block')
+			  AND scope IN ('begin_block', 'end_block', 'finalize_block', 'block')
 		`
 
 		rows, err := ch.Conn.Query(ctx, query, currentHeight, batchEnd)
@@ -296,7 +296,7 @@ func main() {
 		for key, addresses := range blockData {
 			// Determine event scope as int8
 			var eventScope int8 = model.EventScopeBeginBlock
-			if key.Scope == "end_block" {
+			if key.Scope == "end_block" || key.Scope == "finalize_block" {
 				eventScope = model.EventScopeEndBlock
 			}
 

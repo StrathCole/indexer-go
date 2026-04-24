@@ -517,10 +517,10 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 	if scope == "begin_block" {
 		scopeFilter = "AND scope = 'begin_block'"
 	} else if scope == "end_block" {
-		scopeFilter = "AND scope = 'end_block'"
+		scopeFilter = "AND scope IN ('end_block', 'finalize_block')"
 	} else {
-		// Include both begin_block and end_block (and legacy 'block')
-		scopeFilter = "AND scope IN ('begin_block', 'end_block', 'block')"
+		// Include both begin_block and end_block, legacy 'block', and SDK v0.50 FinalizeBlock events.
+		scopeFilter = "AND scope IN ('begin_block', 'end_block', 'finalize_block', 'block')"
 	}
 
 	// Query events
@@ -574,10 +574,7 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Normalize scope name
-			scopeName := row.Scope
-			if scopeName == "block" {
-				scopeName = "begin_block"
-			}
+			scopeName := normalizeBlockEventScope(row.Scope)
 
 			currentEvent = map[string]interface{}{
 				"type":  row.EventType,
@@ -608,6 +605,17 @@ func (s *Server) GetBlockEvents(w http.ResponseWriter, r *http.Request) {
 		"height": height,
 		"events": events,
 	})
+}
+
+func normalizeBlockEventScope(scope string) string {
+	switch scope {
+	case "block":
+		return "begin_block"
+	case "finalize_block":
+		return "end_block"
+	default:
+		return scope
+	}
 }
 
 func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block model.Block, includeEvents bool) {
@@ -775,7 +783,7 @@ func (s *Server) respondBlock(ctx context.Context, w http.ResponseWriter, block 
 
 				currentEvent = map[string]interface{}{
 					"type":  row.EventType,
-					"stage": row.Scope,
+					"stage": normalizeBlockEventScope(row.Scope),
 				}
 				// Clean up TxHash (remove null bytes)
 				txHash := strings.Trim(row.TxHash, "\x00")

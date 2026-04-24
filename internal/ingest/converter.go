@@ -493,7 +493,7 @@ func (s *Service) extractAccountBlockEvents(
 
 	// Determine event scope
 	var eventScope int8 = model.EventScopeBeginBlock
-	if scope == "end_block" {
+	if scope == "end_block" || scope == "finalize_block" {
 		eventScope = model.EventScopeEndBlock
 	}
 

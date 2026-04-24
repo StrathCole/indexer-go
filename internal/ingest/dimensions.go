@@ -46,7 +46,6 @@ func (d *Dimensions) clearAddressCacheIfNeeded() {
 	}
 }
 
-
 func (d *Dimensions) GetOrCreateAddressID(ctx context.Context, address string, lastSeenHeight uint64, lastSeenAt time.Time) (uint64, bool, error) {
 	if v, ok := d.addressCache.Load(address); ok {
 		entry := v.(addressCacheEntry)
