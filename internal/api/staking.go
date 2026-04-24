@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
+	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
+	"cosmossdk.io/math"
 	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
@@ -68,7 +69,7 @@ type RewardsPool struct {
 	Denoms []interface{} `json:"denoms"`
 }
 
-func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, totalBonded float64, priceMap map[string]sdk.Dec) EnrichedValidator {
+func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, totalBonded float64, priceMap map[string]math.LegacyDec) EnrichedValidator {
 	// Convert Operator Address to Account Address
 	accAddr := ""
 	hrp, data, err := bech32.DecodeAndConvert(v.OperatorAddress)
@@ -125,15 +126,15 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 	ev.Description.ProfileIcon = ""
 
 	ev.CommissionInfo.Rate = v.Commission.CommissionRates.Rate.String()
-	if d, err := sdk.NewDecFromStr(ev.CommissionInfo.Rate); err == nil {
+	if d, err := math.LegacyNewDecFromStr(ev.CommissionInfo.Rate); err == nil {
 		ev.CommissionInfo.Rate = fmt.Sprintf("%.10f", d.MustFloat64())
 	}
 	ev.CommissionInfo.MaxRate = v.Commission.CommissionRates.MaxRate.String()
-	if d, err := sdk.NewDecFromStr(ev.CommissionInfo.MaxRate); err == nil {
+	if d, err := math.LegacyNewDecFromStr(ev.CommissionInfo.MaxRate); err == nil {
 		ev.CommissionInfo.MaxRate = fmt.Sprintf("%.10f", d.MustFloat64())
 	}
 	ev.CommissionInfo.MaxChangeRate = v.Commission.CommissionRates.MaxChangeRate.String()
-	if d, err := sdk.NewDecFromStr(ev.CommissionInfo.MaxChangeRate); err == nil {
+	if d, err := math.LegacyNewDecFromStr(ev.CommissionInfo.MaxChangeRate); err == nil {
 		ev.CommissionInfo.MaxChangeRate = fmt.Sprintf("%.10f", d.MustFloat64())
 	}
 	ev.CommissionInfo.UpdateTime = v.Commission.UpdateTime.UTC().Format("2006-01-02T15:04:05.000Z")
@@ -160,7 +161,7 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 
 	if err == nil {
 		var denoms []map[string]string
-		totalRewards := sdk.ZeroDec()
+		totalRewards := math.LegacyZeroDec()
 
 		for _, r := range rewardsResp.Rewards.Rewards {
 			denoms = append(denoms, map[string]string{
@@ -234,7 +235,7 @@ func (s *Server) enrichValidator(ctx context.Context, v stakingtypes.Validator, 
 	return ev
 }
 
-func (s *Server) enrichValidatorsParallel(ctx context.Context, validators []stakingtypes.Validator, totalBonded float64, priceMap map[string]sdk.Dec) ([]EnrichedValidator, error) {
+func (s *Server) enrichValidatorsParallel(ctx context.Context, validators []stakingtypes.Validator, totalBonded float64, priceMap map[string]math.LegacyDec) ([]EnrichedValidator, error) {
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(20) // Limit concurrency to avoid overwhelming the node
 
@@ -295,7 +296,7 @@ func (s *Server) getCachedValidators(ctx context.Context) ([]EnrichedValidator, 
 
 	// Fetch Oracle Prices
 	oracleClient := oracletypes.NewQueryClient(s.clientCtx)
-	priceMap := make(map[string]sdk.Dec)
+	priceMap := make(map[string]math.LegacyDec)
 	ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
 	if err == nil {
 		for _, r := range ratesResp.ExchangeRates {
@@ -358,7 +359,7 @@ func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
 
 		// Fetch Oracle Prices
 		oracleClient := oracletypes.NewQueryClient(s.clientCtx)
-		priceMap := make(map[string]sdk.Dec)
+		priceMap := make(map[string]math.LegacyDec)
 		ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
 		if err == nil {
 			for _, r := range ratesResp.ExchangeRates {
@@ -375,7 +376,7 @@ func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
 		})
 		if err == nil {
 			var commissions []map[string]string
-			totalCommission := sdk.ZeroDec()
+			totalCommission := math.LegacyZeroDec()
 
 			for _, c := range commResp.Commission.Commission {
 				commissions = append(commissions, map[string]string{
@@ -470,7 +471,7 @@ func (s *Server) GetValidator(w http.ResponseWriter, r *http.Request) {
 			})
 			if err == nil {
 				var denoms []map[string]string
-				totalRewards := sdk.ZeroDec()
+				totalRewards := math.LegacyZeroDec()
 
 				for _, r := range rewResp.Rewards {
 					denoms = append(denoms, map[string]string{
@@ -875,7 +876,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// 6. Oracle Prices (needed for user rewards calculation)
-		priceMapDec := make(map[string]sdk.Dec)
+		priceMapDec := make(map[string]math.LegacyDec)
 		g.Go(func() error {
 			ratesResp, err := oracleClient.ExchangeRates(ctx, &oracletypes.QueryExchangeRatesRequest{})
 			if err == nil {
@@ -892,7 +893,7 @@ func (s *Server) GetStakingAccount(w http.ResponseWriter, r *http.Request) {
 
 		// Helper to calculate total rewards in Luna
 		getTotalRewardsAdjustedToLuna := func(rewards sdk.DecCoins) string {
-			total := sdk.ZeroDec()
+			total := math.LegacyZeroDec()
 			for _, r := range rewards {
 				if r.Denom == "uluna" {
 					total = total.Add(r.Amount)

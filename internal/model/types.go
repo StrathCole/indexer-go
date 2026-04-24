@@ -15,24 +15,27 @@ type Block struct {
 
 // Tx represents a transaction in ClickHouse
 type Tx struct {
-	Height       uint64    `ch:"height"`
-	IndexInBlock uint16    `ch:"index_in_block"`
-	BlockTime    time.Time `ch:"block_time"`
-	TxHash       string    `ch:"tx_hash"`
-	Codespace    string    `ch:"codespace"`
-	Code         uint32    `ch:"code"`
-	GasWanted    uint64    `ch:"gas_wanted"`
-	GasUsed      uint64    `ch:"gas_used"`
-	FeeAmounts   []int64   `ch:"fee_amounts"`
-	FeeDenomIDs  []uint16  `ch:"fee_denom_ids"`
-	TaxAmounts   []int64   `ch:"tax_amounts"`
-	TaxDenomIDs  []uint16  `ch:"tax_denom_ids"`
-	MsgTypeIDs   []uint16  `ch:"msg_type_ids"`
-	MsgsJSON     []string  `ch:"msgs_json"`
-	SignaturesJSON []string `ch:"signatures_json"`
-	Memo         string    `ch:"memo"`
-	RawLog       string    `ch:"raw_log"`
-	LogsJSON     string    `ch:"logs_json"`
+	Height         uint64    `ch:"height"`
+	IndexInBlock   uint16    `ch:"index_in_block"`
+	BlockTime      time.Time `ch:"block_time"`
+	TxHash         string    `ch:"tx_hash"`
+	TxBytes        string    `ch:"tx_bytes"`
+	Codespace      string    `ch:"codespace"`
+	Code           uint32    `ch:"code"`
+	TxResponseData string    `ch:"tx_response_data"`
+	TxResponseInfo string    `ch:"tx_response_info"`
+	GasWanted      uint64    `ch:"gas_wanted"`
+	GasUsed        uint64    `ch:"gas_used"`
+	FeeAmounts     []int64   `ch:"fee_amounts"`
+	FeeDenomIDs    []uint16  `ch:"fee_denom_ids"`
+	TaxAmounts     []int64   `ch:"tax_amounts"`
+	TaxDenomIDs    []uint16  `ch:"tax_denom_ids"`
+	MsgTypeIDs     []uint16  `ch:"msg_type_ids"`
+	MsgsJSON       []string  `ch:"msgs_json"`
+	SignaturesJSON []string  `ch:"signatures_json"`
+	Memo           string    `ch:"memo"`
+	RawLog         string    `ch:"raw_log"`
+	LogsJSON       string    `ch:"logs_json"`
 }
 
 // Event represents an event in ClickHouse
@@ -45,6 +48,7 @@ type Event struct {
 	EventType  string    `ch:"event_type"`
 	AttrKey    string    `ch:"attr_key"`
 	AttrValue  string    `ch:"attr_value"`
+	AttrIndex  bool      `ch:"attr_index"`
 	TxHash     string    `ch:"tx_hash"`
 }
 

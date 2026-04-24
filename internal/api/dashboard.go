@@ -15,8 +15,8 @@ import (
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/types/query"
 
-	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
-	treasurytypes "github.com/classic-terra/core/v3/x/treasury/types"
+	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
+	treasurytypes "github.com/classic-terra/core/v4/x/treasury/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	distrtypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"

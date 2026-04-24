@@ -7,14 +7,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/classic-terra/core/v3/app"
+	"github.com/classic-terra/core/v4/app"
+	customauthtx "github.com/classic-terra/core/v4/custom/auth/tx"
 	"github.com/classic-terra/indexer-go/internal/db"
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 	tmtypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	gateway "github.com/cosmos/gogogateway"
 	"github.com/gorilla/mux"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
@@ -27,23 +32,29 @@ type Server struct {
 	clientCtx        client.Context
 	rpc              *rpchttp.HTTP
 	cache            *Cache
+	archivalCache    *ArchivalCache
 	corsOrigins      []string
 	excludedAccounts []string
 	lcdURL           string
 	swaggerCache     swaggerDocCache
+	runtimeStatus    *runtimeStatus
 }
 
 func NewServer(ch *db.ClickHouse, pg *db.Postgres, clientCtx client.Context, rpcClient *rpchttp.HTTP, corsOrigins []string, excludedAccounts []string, lcdURL string) *Server {
-	return &Server{
+	srv := &Server{
 		ch:               ch,
 		pg:               pg,
 		clientCtx:        clientCtx,
 		rpc:              rpcClient,
 		cache:            NewCache(),
+		archivalCache:    NewArchivalCache(),
 		corsOrigins:      corsOrigins,
 		excludedAccounts: excludedAccounts,
 		lcdURL:           lcdURL,
+		runtimeStatus:    newRuntimeStatus(),
 	}
+	srv.startRuntimeMonitor()
+	return srv
 }
 
 func (s *Server) Router() http.Handler {
@@ -112,6 +123,14 @@ func (s *Server) Router() http.Handler {
 	// Root
 	r.HandleFunc("/", s.GetRoot).Methods("GET")
 
+	// Mantlemint-compatible endpoints
+	r.HandleFunc("/index/blocks/{height}", s.MantlemintGetBlock).Methods("GET")
+	r.HandleFunc("/index/tx/by_hash/{hash}", s.MantlemintGetTxByHash).Methods("GET")
+	r.HandleFunc("/index/tx/by_height/{height}", s.MantlemintGetTxsByHeight).Methods("GET")
+	r.HandleFunc("/health", s.MantlemintHealth).Methods("GET")
+	r.HandleFunc("/cosmos/tx/v1beta1/txs", s.GetCosmosTxsEvent).Methods("GET")
+	r.HandleFunc("/cosmos/tx/v1beta1/txs/{hash}", s.GetCosmosTxByHash).Methods("GET")
+
 	// Proxy to LCD (Embedded GRPC Gateway)
 	// We create a new ServeMux for the gateway
 	gwMux := runtime.NewServeMux(
@@ -121,11 +140,19 @@ func (s *Server) Router() http.Handler {
 			Indent:       "  ",
 		}),
 	)
-	// Register routes
+	// Register routes — matching mantlemint's full Cosmos SDK surface area:
+	// 1. All module query routes (bank, staking, auth, distribution, gov, wasm, oracle, etc.)
 	app.ModuleBasics.RegisterGRPCGatewayRoutes(s.clientCtx, gwMux)
+	// 2. TX service routes (/cosmos/tx/v1beta1/txs, simulate, broadcast, encode, decode)
+	authtx.RegisterGRPCGatewayRoutes(s.clientCtx, gwMux)
+	// 3. Terra custom TX routes (tax computation on tx)
+	customauthtx.RegisterGRPCGatewayRoutes(s.clientCtx, gwMux)
+	// 4. Tendermint/CometBFT service routes (blocks, validator sets, node_info, syncing, ABCIQuery)
+	cmtservice.RegisterGRPCGatewayRoutes(s.clientCtx, gwMux)
 
-	// Mount the gateway
-	r.PathPrefix("/").Handler(gwMux)
+	// Mount the gateway behind height middleware + archival cache (mantlemint compat:
+	// ?height=N → x-cosmos-block-height header for historical state queries)
+	r.PathPrefix("/").Handler(blockHeightMiddleware(s.archivalCache.Middleware(gwMux)))
 
 	return r
 }
@@ -193,6 +220,30 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			Str("path", r.URL.Path).
 			Dur("duration", time.Since(start)).
 			Msg("Request")
+	})
+}
+
+// blockHeightMiddleware converts ?height=N query parameter to the
+// x-cosmos-block-height gRPC metadata header, matching mantlemint behavior.
+// This enables historical state queries on archive nodes.
+func blockHeightMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		heightStr := r.FormValue("height")
+		if heightStr != "" {
+			height, err := strconv.ParseInt(heightStr, 10, 64)
+			if err != nil {
+				http.Error(w, `{"code":0,"error":"syntax error"}`, http.StatusBadRequest)
+				return
+			}
+			if height < 0 {
+				http.Error(w, `{"code":0,"error":"height must be equal or greater than zero"}`, http.StatusBadRequest)
+				return
+			}
+			if height > 0 {
+				r.Header.Set("x-cosmos-block-height", heightStr)
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -282,15 +333,18 @@ func (s *Server) GetMempool(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			if account != "" {
 				found := false
-				for _, msg := range tx.GetMsgs() {
-					for _, signer := range msg.GetSigners() {
-						if signer.String() == account {
-							found = true
-							break
-						}
+				// Check if the fee payer matches the account
+				if feeTx, ok := tx.(sdk.FeeTx); ok {
+					payer := sdk.AccAddress(feeTx.FeePayer())
+					if payer.String() == account {
+						found = true
 					}
-					if found {
-						break
+				}
+				if !found {
+					// Fallback: check if account appears in the JSON representation
+					jsonBytes, err := txEncoder(tx)
+					if err == nil && strings.Contains(string(jsonBytes), account) {
+						found = true
 					}
 				}
 				if !found {

@@ -19,7 +19,7 @@ import (
 	"github.com/classic-terra/indexer-go/internal/db"
 	"github.com/classic-terra/indexer-go/internal/model"
 
-	"github.com/classic-terra/core/v3/app"
+	"github.com/classic-terra/core/v4/app"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
@@ -143,33 +143,18 @@ func fetchBlockAndResults(ctx context.Context, rpc *rpchttp.HTTP, height int64) 
 func extractEventsFromBlock(height uint64, blockTime time.Time, blockTxs tmtypes.Txs, results *coretypes.ResultBlockResults, txDecoder sdk.TxDecoder) []model.Event {
 	var out []model.Event
 
-	for i, event := range results.BeginBlockEvents {
+	for i, event := range results.FinalizeBlockEvents {
 		for _, attr := range event.Attributes {
 			out = append(out, model.Event{
 				Height:     height,
 				BlockTime:  blockTime,
-				Scope:      "begin_block",
+				Scope:      "finalize_block",
 				TxIndex:    -1,
 				EventIndex: uint16(i),
 				EventType:  event.Type,
 				AttrKey:    string(attr.Key),
 				AttrValue:  string(attr.Value),
-				TxHash:     "",
-			})
-		}
-	}
-
-	for i, event := range results.EndBlockEvents {
-		for _, attr := range event.Attributes {
-			out = append(out, model.Event{
-				Height:     height,
-				BlockTime:  blockTime,
-				Scope:      "end_block",
-				TxIndex:    -1,
-				EventIndex: uint16(i),
-				EventType:  event.Type,
-				AttrKey:    string(attr.Key),
-				AttrValue:  string(attr.Value),
+				AttrIndex:  attr.Index,
 				TxHash:     "",
 			})
 		}
@@ -198,6 +183,7 @@ func extractEventsFromBlock(height uint64, blockTime time.Time, blockTxs tmtypes
 					EventType:  event.Type,
 					AttrKey:    string(attr.Key),
 					AttrValue:  string(attr.Value),
+					AttrIndex:  attr.Index,
 					TxHash:     txHash,
 				})
 			}
@@ -227,6 +213,7 @@ func insertEvents(ctx context.Context, ch *db.ClickHouse, events []model.Event) 
 			e.EventType,
 			e.AttrKey,
 			e.AttrValue,
+			e.AttrIndex,
 			e.TxHash,
 		); err != nil {
 			return fmt.Errorf("append event: %w", err)

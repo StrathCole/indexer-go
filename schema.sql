@@ -17,8 +17,11 @@ CREATE TABLE IF NOT EXISTS txs (
     block_time      DateTime64(3),
     tx_hash         FixedString(64),
     INDEX idx_tx_hash tx_hash TYPE bloom_filter(0.01) GRANULARITY 4,
+    tx_bytes        String,
     codespace       LowCardinality(String),
     code            UInt32,
+    tx_response_data String,
+    tx_response_info String,
     gas_wanted      UInt64,
     gas_used        UInt64,
     fee_amounts     Array(Int64),
@@ -50,11 +53,39 @@ CREATE TABLE IF NOT EXISTS events (
     INDEX idx_events_attr_key attr_key TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_events_type_key (event_type, attr_key) TYPE bloom_filter(0.01) GRANULARITY 4,
     attr_value      String,
+    attr_index      Bool DEFAULT false,
     tx_hash         FixedString(64) DEFAULT ''
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(block_time)
 ORDER BY (height, scope, tx_index, event_index, event_type, attr_key);
+
+-- Search-oriented tx event lookup used by the local /cosmos/tx/v1beta1/txs implementation.
+-- Existing deployments should backfill once:
+-- INSERT INTO tx_event_lookup SELECT event_type, attr_key, attr_value, height, toUInt16(tx_index), tx_hash FROM events WHERE scope = 'tx' AND tx_index >= 0;
+CREATE TABLE IF NOT EXISTS tx_event_lookup (
+    event_type      LowCardinality(String),
+    attr_key        LowCardinality(String),
+    attr_value      String,
+    height          UInt64,
+    index_in_block  UInt16,
+    tx_hash         FixedString(64)
+)
+ENGINE = MergeTree
+ORDER BY (event_type, attr_key, attr_value, height, index_in_block);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_tx_event_lookup
+TO tx_event_lookup
+AS
+SELECT
+    event_type,
+    attr_key,
+    attr_value,
+    height,
+    toUInt16(tx_index) AS index_in_block,
+    tx_hash
+FROM events
+WHERE scope = 'tx' AND tx_index >= 0;
 
 -- Account activity tracking for both transactions and block events
 CREATE TABLE IF NOT EXISTS account_txs (

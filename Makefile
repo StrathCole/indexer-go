@@ -18,6 +18,9 @@ build-tools:
 	go build -o build/fix_timestamps ./cmd/tools/fix_timestamps
 	go build -o build/backfill_account_blocks ./cmd/tools/backfill_account_blocks
 	go build -o build/backfill_dashboard_aggregates ./cmd/tools/backfill_dashboard_aggregates
+	go build -o build/repair_missing_tx_data ./cmd/tools/repair_missing_tx_data
+	go build -o build/reindex_blocks ./cmd/tools/reindex_blocks
+	go build -o build/backfill_tx_search ./cmd/tools/backfill_tx_search
 	go build -o build/migrate_ch_to_pg ./cmd/tools/migrate_ch_to_pg
 
 clean:

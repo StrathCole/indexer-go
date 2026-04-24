@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/classic-terra/core/v3/app"
+	"github.com/classic-terra/core/v4/app"
 	"github.com/classic-terra/indexer-go/internal/api"
 	"github.com/classic-terra/indexer-go/internal/config"
 	"github.com/classic-terra/indexer-go/internal/db"

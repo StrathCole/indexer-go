@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/classic-terra/core/v3/app"
+	"github.com/classic-terra/core/v4/app"
 	"github.com/classic-terra/indexer-go/internal/config"
 	"github.com/classic-terra/indexer-go/internal/db"
 	"github.com/classic-terra/indexer-go/internal/ingest"
@@ -18,13 +18,33 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	protov2 "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
 )
 
 type DummyTx struct {
 	Msgs []sdk.Msg
 }
 
-func (tx *DummyTx) GetMsgs() []sdk.Msg   { return tx.Msgs }
+func (tx *DummyTx) GetMsgs() []sdk.Msg { return tx.Msgs }
+func (tx *DummyTx) GetMsgsV2() ([]protov2.Message, error) {
+	msgs := make([]protov2.Message, 0, len(tx.Msgs))
+	for _, msg := range tx.Msgs {
+		if msgV2, ok := any(msg).(protov2.Message); ok {
+			msgs = append(msgs, msgV2)
+			continue
+		}
+
+		if msgV1, ok := any(msg).(protoadapt.MessageV1); ok {
+			msgs = append(msgs, protoadapt.MessageV2Of(msgV1))
+			continue
+		}
+
+		return nil, fmt.Errorf("msg %T does not implement a supported protobuf interface", msg)
+	}
+
+	return msgs, nil
+}
 func (tx *DummyTx) ValidateBasic() error { return nil }
 
 func main() {

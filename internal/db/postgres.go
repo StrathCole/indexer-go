@@ -53,6 +53,29 @@ func (pg *Postgres) BlockExists(ctx context.Context, height int64) (bool, error)
 	return exists, nil
 }
 
+func (pg *Postgres) DeleteBlockData(ctx context.Context, height uint64) error {
+	tx, err := pg.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin block data delete: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, stmt := range []string{
+		"DELETE FROM account_txs WHERE height = $1",
+		"DELETE FROM oracle_prices WHERE height = $1",
+		"DELETE FROM blocks WHERE height = $1",
+	} {
+		if _, err := tx.Exec(ctx, stmt, height); err != nil {
+			return fmt.Errorf("delete postgres block data at height %d: %w", height, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit block data delete: %w", err)
+	}
+	return nil
+}
+
 // PgBlock mirrors model.Block but with db-friendly scanning.
 type PgBlock struct {
 	Height          uint64

@@ -7,9 +7,10 @@ import (
 	"strconv"
 	"sync"
 
+	"cosmossdk.io/math"
 	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
-	markettypes "github.com/classic-terra/core/v3/x/market/types"
-	treasurytypes "github.com/classic-terra/core/v3/x/treasury/types"
+	markettypes "github.com/classic-terra/core/v4/x/market/types"
+	treasurytypes "github.com/classic-terra/core/v4/x/treasury/types"
 	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	grpctypes "github.com/cosmos/cosmos-sdk/types/grpc"
@@ -27,10 +28,10 @@ const (
 )
 
 type TaxPolicy struct {
-	Rate          sdk.Dec
-	Caps          map[string]sdk.Int
+	Rate          math.LegacyDec
+	Caps          map[string]math.Int
 	ExemptionList []string
-	PolicyCap     sdk.Int
+	PolicyCap     math.Int
 }
 
 // CachedTaxPolicy includes validity range
@@ -75,7 +76,7 @@ func (tc *TaxCalculator) fetchPolicyAtHeight(ctx context.Context, height int64) 
 	treasuryClient := treasurytypes.NewQueryClient(tc.grpcConn)
 
 	// Fetch Tax Rate
-	var rate sdk.Dec
+	var rate math.LegacyDec
 	r, err := tc.fetchTaxRateGRPC(ctx, "/terra.treasury.v1beta1.Query/TaxRate")
 	if err == nil {
 		rate = r
@@ -96,7 +97,7 @@ func (tc *TaxCalculator) fetchPolicyAtHeight(ctx context.Context, height int64) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch tax caps: %w", err)
 	}
-	caps := make(map[string]sdk.Int)
+	caps := make(map[string]math.Int)
 	for _, c := range capsRes.TaxCaps {
 		caps[c.Denom] = c.TaxCap
 	}
@@ -325,7 +326,7 @@ func (tc *TaxCalculator) CalculateTax(ctx context.Context, height int64, tx sdk.
 			}
 
 			// tax = min(amount * rate, cap)
-			taxAmount := sdk.NewDecFromInt(coin.Amount).Mul(policy.Rate).TruncateInt()
+			taxAmount := math.LegacyNewDecFromInt(coin.Amount).Mul(policy.Rate).TruncateInt()
 			if taxAmount.GT(cap) {
 				taxAmount = cap
 			}
@@ -412,21 +413,21 @@ func (m *RawTaxRateResponse) Reset()         { *m = RawTaxRateResponse{} }
 func (m *RawTaxRateResponse) String() string { return fmt.Sprintf("%v", *m) }
 func (m *RawTaxRateResponse) ProtoMessage()  {}
 
-func (tc *TaxCalculator) fetchTaxRateGRPC(ctx context.Context, method string) (sdk.Dec, error) {
+func (tc *TaxCalculator) fetchTaxRateGRPC(ctx context.Context, method string) (math.LegacyDec, error) {
 	out := new(RawTaxRateResponse)
 	err := tc.grpcConn.Invoke(ctx, method, nil, out)
 	if err != nil {
-		return sdk.Dec{}, err
+		return math.LegacyDec{}, err
 	}
 
-	dec, err := sdk.NewDecFromStr(out.TaxRate)
+	dec, err := math.LegacyNewDecFromStr(out.TaxRate)
 	if err != nil {
-		return sdk.Dec{}, err
+		return math.LegacyDec{}, err
 	}
 
 	// Heuristic: If tax rate is > 1, it's likely an unscaled integer (10^18)
-	if dec.GT(sdk.OneDec()) {
-		precision := sdk.NewDecFromIntWithPrec(sdk.OneInt(), 18)
+	if dec.GT(math.LegacyOneDec()) {
+		precision := math.LegacyNewDecFromIntWithPrec(math.OneInt(), 18)
 		dec = dec.Mul(precision)
 	}
 

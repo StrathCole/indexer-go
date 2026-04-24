@@ -13,6 +13,15 @@ It uses ClickHouse for storing historical data (blocks, txs, events) and Postgre
 The API serves Swagger UI at `/swagger/` and the raw Swagger 2.0 spec at `/swagger/doc.json`.
 If `node.lcd` is configured, the spec is merged with the node's LCD swagger (`/swagger/swagger.yaml`) for a more comprehensive doc set.
 
+## Health
+
+The API serves `/health`.
+
+- `200 OK`: indexed block height is caught up to the node within one block
+- `503 NOK`: indexer data is still behind, or the runtime sync check is stale or unavailable
+
+Latest non-heighted gateway responses are also purged automatically as node or indexed height advances, so cached latest-state queries do not stay stale indefinitely.
+
 ## Prerequisites
 
 - Go 1.24+
@@ -98,6 +107,64 @@ You can apply the schema directly using the `clickhouse-client` and the `schema.
 ```bash
 clickhouse-client --user fcd_user --password password --database=fcd --multiquery < schema.sql
 ```
+
+If you are upgrading an existing deployment and want fast local `/cosmos/tx/v1beta1/txs` query or events search, do not rewrite the full historical tx payload by default. The storage-safe default is:
+
+1. migrate the ClickHouse schema for the new columns and lookup table
+2. backfill only `tx_event_lookup` from existing `events`
+3. let new ingest fill `tx_bytes`, `tx_response_data`, and `tx_response_info` going forward
+4. keep node fallback for older tx rows that predate these fields
+
+The repository includes a helper tool for this live migration:
+
+```bash
+./build/backfill_tx_search --config ../../../ --create-only
+./build/backfill_tx_search --config ../../../ --backfill-only
+```
+
+If you need to re-run the lookup backfill, pause ingest first and rebuild the lookup table from scratch to avoid duplicate storage:
+
+```bash
+./build/backfill_tx_search --config ../../../ --backfill-only --truncate-lookup
+```
+
+The one-time lookup backfill is equivalent to:
+
+```sql
+INSERT INTO tx_event_lookup
+SELECT event_type, attr_key, attr_value, height, toUInt16(tx_index), tx_hash
+FROM events
+WHERE scope = 'tx' AND tx_index >= 0;
+```
+
+This is intentionally limited to the lookup table. A full historical backfill of `tx_bytes` and `tx_response_*` would require refetching blocks from RPC and would duplicate large amounts of transaction payload data across ~27M blocks, so the default strategy avoids that.
+
+If you later decide to selectively repair historical tx payload gaps, use the height-rewrite tool instead of trying to update ClickHouse rows in place. It scans `txs` for rows where `tx_bytes = ''`, refetches those heights from RPC, then repairs ClickHouse with `ALTER TABLE ... DELETE` followed by fresh inserts:
+
+```bash
+./build/repair_missing_tx_data --config ../../../
+```
+
+Useful flags:
+
+```bash
+./build/repair_missing_tx_data --config ../../../ --from-height 1000000 --to-height 1500000
+./build/repair_missing_tx_data --config ../../../ --rewrite-batch-size 10 --delete-timeout 30m
+./build/repair_missing_tx_data --config ../../../ --dry-run
+```
+
+By default this also rewrites `events` and `tx_event_lookup` for the same affected heights, so `attr_index` is repaired anywhere the tx payload repair touches. It does not discover event-only gaps on heights whose tx rows are already complete; use the event refetch tool for those cases.
+
+For a full block reindex of heights that were already indexed, pause live ingest and use the reindex tool. It refetches each target block from RPC first, deletes existing height-scoped rows from ClickHouse and PostgreSQL, waits for ClickHouse deletes to finish, then inserts the freshly converted block data:
+
+```bash
+./build/reindex_blocks --config ../../../ --height 123456
+./build/reindex_blocks --config ../../../ --from-height 1000000 --to-height 1000100
+./build/reindex_blocks --config ../../../ --heights 123456,123457 --dry-run
+```
+
+The reindex delete covers raw block-derived tables: `blocks`, `txs`, `events`, `tx_event_lookup`, `account_txs`, `oracle_prices`, `validator_returns`, and `block_rewards` in ClickHouse when present, plus `blocks`, `account_txs`, and `oracle_prices` in PostgreSQL.
+After reinserting, it also refreshes affected ClickHouse dashboard aggregate rows (`account_txs_daily_active_tx`, `address_first_seen_tx`, `registered_accounts_daily_tx`) when those tables exist.
 
 If you already have an existing `txs` table, make sure it has a data-skipping index on `tx_hash` (used by the single-tx endpoint `/v1/txs/{hash}`). You can add it and materialize it like this:
 

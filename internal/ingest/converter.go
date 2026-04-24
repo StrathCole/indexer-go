@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -190,8 +191,11 @@ func (s *Service) convertTx(
 		IndexInBlock:   index,
 		BlockTime:      blockTime,
 		TxHash:         txHashRaw,
+		TxBytes:        string(txBytes(tx)),
 		Codespace:      res.Codespace,
 		Code:           res.Code,
+		TxResponseData: strings.ToUpper(hex.EncodeToString(res.Data)),
+		TxResponseInfo: res.Info,
 		GasWanted:      uint64(res.GasWanted),
 		GasUsed:        uint64(res.GasUsed),
 		FeeAmounts:     feeAmounts,
@@ -219,6 +223,7 @@ func (s *Service) convertTx(
 				EventType:  event.Type,
 				AttrKey:    string(attr.Key),
 				AttrValue:  string(attr.Value),
+				AttrIndex:  attr.Index,
 				TxHash:     txHashRaw,
 			})
 		}
@@ -231,6 +236,13 @@ func (s *Service) convertTx(
 	}
 
 	return modelTx, events, accountTxs, newAccounts, nil
+}
+
+func txBytes(tx sdk.Tx) []byte {
+	if txWithBytes, ok := tx.(interface{ Bytes() []byte }); ok {
+		return txWithBytes.Bytes()
+	}
+	return nil
 }
 
 // isTerraAddress checks if a string is a valid Terra address (terra1... bech32)

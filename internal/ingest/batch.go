@@ -31,8 +31,11 @@ func (s *Service) BatchInsert(
 				t.IndexInBlock,
 				t.BlockTime,
 				t.TxHash,
+				t.TxBytes,
 				t.Codespace,
 				t.Code,
+				t.TxResponseData,
+				t.TxResponseInfo,
 				t.GasWanted,
 				t.GasUsed,
 				t.FeeAmounts,
@@ -70,6 +73,7 @@ func (s *Service) BatchInsert(
 				e.EventType,
 				e.AttrKey,
 				e.AttrValue,
+				e.AttrIndex,
 				e.TxHash,
 			)
 			if err != nil {

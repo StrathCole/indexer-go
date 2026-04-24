@@ -6,7 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
+	sdkmath "cosmossdk.io/math"
+	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
@@ -40,7 +41,7 @@ GROUP BY denom
 
 	// Fetch Oracle Prices
 	oracleClient := oracletypes.NewQueryClient(s.clientCtx)
-	priceMap := make(map[string]sdk.Dec)
+	priceMap := make(map[string]sdkmath.LegacyDec)
 	ratesResp, err := oracleClient.ExchangeRates(context.Background(), &oracletypes.QueryExchangeRatesRequest{})
 	if err == nil {
 		for _, r := range ratesResp.ExchangeRates {
@@ -49,10 +50,10 @@ GROUP BY denom
 	}
 
 	var filteredProceeds []TaxProceed
-	total := sdk.ZeroDec()
+	total := sdkmath.LegacyZeroDec()
 
 	for _, p := range proceeds {
-		amount, err := sdk.NewDecFromStr(p.Total)
+		amount, err := sdkmath.LegacyNewDecFromStr(p.Total)
 		if err != nil {
 			continue
 		}
@@ -234,23 +235,23 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Helper to find amount in list and convert to sdk.Dec
-	findAmount := func(coins sdk.Coins, d string) sdk.Dec {
+	// Helper to find amount in list and convert to sdkmath.LegacyDec
+	findAmount := func(coins sdk.Coins, d string) sdkmath.LegacyDec {
 		for _, c := range coins {
 			if c.Denom == d {
-				return sdk.NewDecFromInt(c.Amount)
+				return sdkmath.LegacyNewDecFromInt(c.Amount)
 			}
 		}
-		return sdk.ZeroDec()
+		return sdkmath.LegacyZeroDec()
 	}
 
-	findPoolAmount := func(coins sdk.DecCoins, d string) sdk.Dec {
+	findPoolAmount := func(coins sdk.DecCoins, d string) sdkmath.LegacyDec {
 		for _, c := range coins {
 			if c.Denom == d {
 				return c.Amount
 			}
 		}
-		return sdk.ZeroDec()
+		return sdkmath.LegacyZeroDec()
 	}
 
 	if denom != "" {
@@ -261,7 +262,7 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 		circulating := totalSupply.Sub(poolAmount).Sub(excludedAmount)
 
 		if circulating.IsNegative() {
-			circulating = sdk.ZeroDec()
+			circulating = sdkmath.LegacyZeroDec()
 		}
 
 		// FCD returns number
@@ -273,12 +274,12 @@ func (s *Server) GetCirculatingSupply(w http.ResponseWriter, r *http.Request) {
 	for _, sCoin := range supply {
 		poolAmount := findPoolAmount(pool, sCoin.Denom)
 		excludedAmount := findAmount(excludedCoins, sCoin.Denom)
-		totalSupply := sdk.NewDecFromInt(sCoin.Amount)
+		totalSupply := sdkmath.LegacyNewDecFromInt(sCoin.Amount)
 
 		circulating := totalSupply.Sub(poolAmount).Sub(excludedAmount)
 
 		if circulating.IsNegative() {
-			circulating = sdk.ZeroDec()
+			circulating = sdkmath.LegacyZeroDec()
 		}
 
 		result = append(result, map[string]interface{}{

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	oracletypes "github.com/classic-terra/core/v3/x/oracle/types"
+	oracletypes "github.com/classic-terra/core/v4/x/oracle/types"
 	"github.com/gorilla/mux"
 )
 

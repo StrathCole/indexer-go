@@ -27,7 +27,7 @@ import (
 	// We might need to use the CometBFT RPC client for blocks if gRPC doesn't provide everything
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 
-	"github.com/classic-terra/core/v3/app"
+	"github.com/classic-terra/core/v4/app"
 	tmtypes "github.com/cometbft/cometbft/types"
 )
 
@@ -669,10 +669,10 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	oraclePrices := s.extractOraclePrices(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		results.EndBlockEvents,
+		results.FinalizeBlockEvents,
 	)
 
-	allBlockEvents := append(results.BeginBlockEvents, results.EndBlockEvents...)
+	allBlockEvents := results.FinalizeBlockEvents
 	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -683,46 +683,26 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	var modelEvents []model.Event
 	var modelAccountTxs []model.AccountTx
 
-	beginBlockEvents := s.convertBlockEvents(
+	finalizeBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"begin_block",
-		results.BeginBlockEvents,
-	)
-	endBlockEvents := s.convertBlockEvents(
-		uint64(block.Block.Height),
-		block.Block.Time,
-		"end_block",
-		results.EndBlockEvents,
+		"finalize_block",
+		results.FinalizeBlockEvents,
 	)
 
-	modelEvents = append(modelEvents, beginBlockEvents...)
-	modelEvents = append(modelEvents, endBlockEvents...)
+	modelEvents = append(modelEvents, finalizeBlockEvents...)
 
-	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+	finalizeBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"begin_block",
-		results.BeginBlockEvents,
+		"finalize_block",
+		results.FinalizeBlockEvents,
 	)
 	if err != nil {
-		log.Printf("Failed to extract begin_block account relations: %v", err)
+		log.Printf("Failed to extract finalize_block account relations: %v", err)
 	} else {
-		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
-	}
-
-	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
-		context.Background(),
-		uint64(block.Block.Height),
-		block.Block.Time,
-		"end_block",
-		results.EndBlockEvents,
-	)
-	if err != nil {
-		log.Printf("Failed to extract end_block account relations: %v", err)
-	} else {
-		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
+		modelAccountTxs = append(modelAccountTxs, finalizeBlockAccountTxs...)
 	}
 
 	for i, txBytes := range block.Block.Txs {
@@ -753,6 +733,19 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	}
 
 	return modelBlock, modelTxs, modelEvents, modelAccountTxs, oraclePrices, validatorReturns, blockRewards, nil
+}
+
+func (s *Service) FetchAndConvertBlock(height int64) (
+	model.Block,
+	[]model.Tx,
+	[]model.Event,
+	[]model.AccountTx,
+	[]model.OraclePrice,
+	[]model.ValidatorReturn,
+	[]model.BlockReward,
+	error,
+) {
+	return s.fetchAndConvertBlock(height)
 }
 
 func (s *Service) ProcessBlock(height int64) error {
@@ -800,15 +793,15 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	// Convert Block
 	modelBlock := s.convertBlock(block)
 
-	// Extract Oracle Prices from EndBlock events
+	// Extract Oracle Prices from FinalizeBlock events
 	oraclePrices := s.extractOraclePrices(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		results.EndBlockEvents,
+		results.FinalizeBlockEvents,
 	)
 
 	// Extract Block Rewards and Validator Returns
-	allBlockEvents := append(results.BeginBlockEvents, results.EndBlockEvents...)
+	allBlockEvents := results.FinalizeBlockEvents
 	blockRewards, validatorReturns := s.extractBlockRewardsAndReturns(
 		uint64(block.Block.Height),
 		block.Block.Time,
@@ -820,48 +813,28 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	var modelAccountTxs []model.AccountTx
 	var newAccountsTx uint64
 
-	// Convert Block Events (BeginBlock & EndBlock)
-	beginBlockEvents := s.convertBlockEvents(
+	// Convert Block Events (FinalizeBlock)
+	finalizeBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"begin_block",
-		results.BeginBlockEvents,
-	)
-	endBlockEvents := s.convertBlockEvents(
-		uint64(block.Block.Height),
-		block.Block.Time,
-		"end_block",
-		results.EndBlockEvents,
+		"finalize_block",
+		results.FinalizeBlockEvents,
 	)
 
-	modelEvents = append(modelEvents, beginBlockEvents...)
-	modelEvents = append(modelEvents, endBlockEvents...)
+	modelEvents = append(modelEvents, finalizeBlockEvents...)
 
 	// Extract account activity from block events (stored in account_txs with special index values)
-	beginBlockAccountTxs, _, err := s.extractAccountBlockEvents(
+	finalizeBlockAccountTxs, _, err := s.extractAccountBlockEvents(
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"begin_block",
-		results.BeginBlockEvents,
+		"finalize_block",
+		results.FinalizeBlockEvents,
 	)
 	if err != nil {
-		log.Printf("Failed to extract begin_block account relations: %v", err)
+		log.Printf("Failed to extract finalize_block account relations: %v", err)
 	} else {
-		modelAccountTxs = append(modelAccountTxs, beginBlockAccountTxs...)
-	}
-
-	endBlockAccountTxs, _, err := s.extractAccountBlockEvents(
-		context.Background(),
-		uint64(block.Block.Height),
-		block.Block.Time,
-		"end_block",
-		results.EndBlockEvents,
-	)
-	if err != nil {
-		log.Printf("Failed to extract end_block account relations: %v", err)
-	} else {
-		modelAccountTxs = append(modelAccountTxs, endBlockAccountTxs...)
+		modelAccountTxs = append(modelAccountTxs, finalizeBlockAccountTxs...)
 	}
 
 	for i, txBytes := range block.Block.Txs {
