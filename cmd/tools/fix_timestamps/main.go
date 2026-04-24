@@ -94,7 +94,7 @@ func main() {
     height          UInt64,
 	INDEX idx_events_height height TYPE minmax GRANULARITY 1,
     block_time      DateTime64(3),
-    scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3, 'finalize_block' = 4),
+    scope           Enum8('block' = 0, 'tx' = 1, 'begin_block' = 2, 'end_block' = 3),
     tx_index        Int16,
     event_index     UInt16,
     event_type      LowCardinality(String),

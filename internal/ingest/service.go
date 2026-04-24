@@ -686,7 +686,7 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 	finalizeBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"finalize_block",
+		"end_block",
 		results.FinalizeBlockEvents,
 	)
 
@@ -696,7 +696,7 @@ func (s *Service) fetchAndConvertBlock(height int64) (
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"finalize_block",
+		"end_block",
 		results.FinalizeBlockEvents,
 	)
 	if err != nil {
@@ -817,7 +817,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 	finalizeBlockEvents := s.convertBlockEvents(
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"finalize_block",
+		"end_block",
 		results.FinalizeBlockEvents,
 	)
 
@@ -828,7 +828,7 @@ func (s *Service) saveBlock(block *coretypes.ResultBlock, results *coretypes.Res
 		context.Background(),
 		uint64(block.Block.Height),
 		block.Block.Time,
-		"finalize_block",
+		"end_block",
 		results.FinalizeBlockEvents,
 	)
 	if err != nil {

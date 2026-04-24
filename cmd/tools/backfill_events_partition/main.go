@@ -148,7 +148,7 @@ func extractEventsFromBlock(height uint64, blockTime time.Time, blockTxs tmtypes
 			out = append(out, model.Event{
 				Height:     height,
 				BlockTime:  blockTime,
-				Scope:      "finalize_block",
+				Scope:      "end_block",
 				TxIndex:    -1,
 				EventIndex: uint16(i),
 				EventType:  event.Type,
