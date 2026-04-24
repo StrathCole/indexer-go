@@ -165,16 +165,16 @@ func (s *Service) reindexAggregateInputs(ctx context.Context, height uint64, blo
 		return nil, nil, fmt.Errorf("check ClickHouse account_txs: %w", err)
 	}
 	if exists {
-		var existingAddressIDs []uint64
-		if err := s.ch.Conn.Select(ctx, &existingAddressIDs, fmt.Sprintf("SELECT DISTINCT address_id FROM account_txs WHERE height = %d", height)); err != nil {
+		existingAddressIDs, err := s.queryClickHouseUint64Column(ctx, fmt.Sprintf("SELECT DISTINCT address_id FROM account_txs WHERE height = %d", height))
+		if err != nil {
 			return nil, nil, fmt.Errorf("load existing account_txs address ids for height %d: %w", height, err)
 		}
 		for _, id := range existingAddressIDs {
 			addressIDs[id] = struct{}{}
 		}
 
-		var existingDays []string
-		if err := s.ch.Conn.Select(ctx, &existingDays, fmt.Sprintf("SELECT DISTINCT toString(toDate(block_time)) FROM account_txs WHERE height = %d", height)); err != nil {
+		existingDays, err := s.queryClickHouseStringColumn(ctx, fmt.Sprintf("SELECT DISTINCT toString(toDate(block_time)) FROM account_txs WHERE height = %d", height))
+		if err != nil {
 			return nil, nil, fmt.Errorf("load existing account_txs days for height %d: %w", height, err)
 		}
 		for _, day := range existingDays {
@@ -302,7 +302,6 @@ func (s *Service) collectAddressFirstSeenDays(ctx context.Context, addressIDs []
 
 	days := make(map[string]struct{})
 	for _, chunk := range chunkUint64s(addressIDs, 5000) {
-		var chunkDays []string
 		query := fmt.Sprintf(`
 SELECT DISTINCT toString(toDate(first_seen))
 FROM (
@@ -311,7 +310,8 @@ FROM (
 	WHERE address_id IN (%s)
 	GROUP BY address_id
 )`, joinUint64s(chunk))
-		if err := s.ch.Conn.Select(ctx, &chunkDays, query); err != nil {
+		chunkDays, err := s.queryClickHouseStringColumn(ctx, query)
+		if err != nil {
 			return nil, fmt.Errorf("collect address_first_seen_tx days: %w", err)
 		}
 		for _, day := range chunkDays {
@@ -322,6 +322,48 @@ FROM (
 	}
 
 	return sortedStringKeys(days), nil
+}
+
+func (s *Service) queryClickHouseUint64Column(ctx context.Context, query string) ([]uint64, error) {
+	rows, err := s.ch.Conn.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []uint64
+	for rows.Next() {
+		var value uint64
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Service) queryClickHouseStringColumn(ctx context.Context, query string) ([]string, error) {
+	rows, err := s.ch.Conn.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, days []string, timeout time.Duration, pollInterval time.Duration) error {
