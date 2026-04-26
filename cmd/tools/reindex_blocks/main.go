@@ -30,6 +30,8 @@ func main() {
 	batchSize := flag.Int("batch-size", 100, "Number of heights to reindex per batch (1 = legacy per-height mode)")
 	fetchWorkers := flag.Int("fetch-workers", 6, "Number of concurrent block fetch/convert workers per chunk")
 	skipAggregates := flag.Bool("skip-aggregates", false, "Skip aggregate-table refresh during reindex (faster catch-up; aggregates can be rebuilt later)")
+	predeleteRange := flag.Bool("predelete-range", false, "Delete all target heights first (chunked), then reindex without per-chunk deletes")
+	predeleteChunkSize := flag.Int("predelete-chunk-size", 1000, "Heights per pre-delete chunk when --predelete-range is enabled")
 	dryRun := flag.Bool("dry-run", false, "Fetch and convert target blocks, but do not delete or insert")
 	continueOnError := flag.Bool("continue-on-error", true, "Continue reindexing remaining heights after an error")
 	flag.Parse()
@@ -55,6 +57,9 @@ func main() {
 	}
 	if *fetchWorkers <= 0 {
 		log.Fatalf("--fetch-workers must be > 0")
+	}
+	if *predeleteChunkSize <= 0 {
+		log.Fatalf("--predelete-chunk-size must be > 0")
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -96,9 +101,22 @@ func main() {
 	}
 
 	log.Printf("Reindexing %d block(s), dry_run=%t", len(targetHeights), *dryRun)
-	log.Printf("Reindex settings: batch_size=%d fetch_workers=%d skip_aggregates=%t", *batchSize, *fetchWorkers, *skipAggregates)
+	log.Printf("Reindex settings: batch_size=%d fetch_workers=%d skip_aggregates=%t predelete_range=%t predelete_chunk_size=%d", *batchSize, *fetchWorkers, *skipAggregates, *predeleteRange, *predeleteChunkSize)
 	if !*dryRun {
 		log.Printf("Pause live ingest while this runs; reindex deletes height-scoped rows before reinserting fresh data.")
+	}
+
+	if !*dryRun && *predeleteRange {
+		log.Printf("Pre-delete phase: deleting existing rows for all %d target heights", len(targetHeights))
+		if err := svc.PreDeleteHeightsForReindex(context.Background(), targetHeights, ingest.ReindexOptions{
+			DeleteTimeout:      *deleteTimeout,
+			DeletePollInterval: *deletePollInterval,
+			ProgressInterval:   *progressInterval,
+			Progress:           log.Printf,
+		}, *predeleteChunkSize); err != nil {
+			log.Fatalf("Pre-delete phase failed: %v", err)
+		}
+		log.Printf("Pre-delete phase complete")
 	}
 
 	ctx := context.Background()
@@ -121,6 +139,7 @@ func main() {
 			ProgressInterval:   *progressInterval,
 			FetchWorkers:       *fetchWorkers,
 			SkipAggregates:     *skipAggregates,
+			SkipDelete:         *predeleteRange,
 			DryRun:             *dryRun,
 			Progress:           log.Printf,
 		})
@@ -138,6 +157,7 @@ func main() {
 					ProgressInterval:   *progressInterval,
 					FetchWorkers:       *fetchWorkers,
 					SkipAggregates:     *skipAggregates,
+					SkipDelete:         *predeleteRange,
 					DryRun:             *dryRun,
 					Progress:           log.Printf,
 				})
@@ -171,6 +191,11 @@ func main() {
 		}
 
 		succeeded += len(summaries)
+		if len(summaries) < len(chunk) {
+			skipped := len(chunk) - len(summaries)
+			failed += skipped
+			log.Printf("Chunk %d..%d: skipped %d height(s) due fetch/convert failures", chunk[0], chunk[len(chunk)-1], skipped)
+		}
 		processed := succeeded + failed
 		avg := time.Since(runStarted) / time.Duration(processed)
 		eta := avg * time.Duration(total-processed)

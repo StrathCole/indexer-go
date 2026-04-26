@@ -17,6 +17,7 @@ type ReindexOptions struct {
 	ProgressInterval   time.Duration
 	FetchWorkers       int
 	SkipAggregates     bool
+	SkipDelete         bool
 	DryRun             bool
 	Progress           func(format string, args ...any)
 }
@@ -114,8 +115,10 @@ func (s *Service) ReindexBlock(ctx context.Context, height int64, opts ReindexOp
 	}
 
 	opts.progressf("height %d: deleting old rows", height)
-	if err := s.deleteBlockData(ctx, block.Height, opts); err != nil {
-		return summary, err
+	if !opts.SkipDelete {
+		if err := s.deleteBlockData(ctx, block.Height, opts); err != nil {
+			return summary, err
+		}
 	}
 
 	opts.progressf("height %d: inserting fresh rows", height)
@@ -166,6 +169,7 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 	}
 	type fetchResult struct {
 		idx     int
+		height  int64
 		summary ReindexSummary
 		payload reindexBlockPayload
 		err     error
@@ -188,11 +192,11 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 				opts.progressf("height %d: fetching and converting block", job.height)
 				block, txs, events, accountTxs, oraclePrices, validatorReturns, blockRewards, err := s.FetchAndConvertBlock(job.height)
 				if err != nil {
-					results <- fetchResult{idx: job.idx, err: fmt.Errorf("fetch and convert height %d: %w", job.height, err)}
+					results <- fetchResult{idx: job.idx, height: job.height, err: fmt.Errorf("fetch and convert height %d: %w", job.height, err)}
 					continue
 				}
 				if block.Height != uint64(job.height) {
-					results <- fetchResult{idx: job.idx, err: fmt.Errorf("fetched height mismatch: requested %d, got %d", job.height, block.Height)}
+					results <- fetchResult{idx: job.idx, height: job.height, err: fmt.Errorf("fetched height mismatch: requested %d, got %d", job.height, block.Height)}
 					continue
 				}
 
@@ -211,6 +215,7 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 
 				results <- fetchResult{
 					idx:     job.idx,
+					height:  job.height,
 					summary: summary,
 					payload: reindexBlockPayload{
 						height:           block.Height,
@@ -234,24 +239,35 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 
 	summariesByIdx := make([]ReindexSummary, len(heights))
 	payloadsByIdx := make([]reindexBlockPayload, len(heights))
-	var fetchErr error
+	hasPayloadByIdx := make([]bool, len(heights))
+	failedHeights := make([]int64, 0)
+	var firstFetchErr error
 	for result := range results {
 		if result.err != nil {
-			if fetchErr == nil {
-				fetchErr = result.err
+			if firstFetchErr == nil {
+				firstFetchErr = result.err
 			}
+			failedHeights = append(failedHeights, result.height)
+			opts.progressf("height %d: fetch/convert failed: %v", result.height, result.err)
 			continue
 		}
 		summariesByIdx[result.idx] = result.summary
 		payloadsByIdx[result.idx] = result.payload
+		hasPayloadByIdx[result.idx] = true
 	}
-	if fetchErr != nil {
-		return nil, fetchErr
+	if len(failedHeights) > 0 {
+		opts.progressf("batch: skipping %d height(s) due fetch/convert failures", len(failedHeights))
+		if len(failedHeights) == len(heights) {
+			return nil, firstFetchErr
+		}
 	}
 
 	summaries := make([]ReindexSummary, 0, len(heights))
 	payloads := make([]reindexBlockPayload, 0, len(heights))
 	for i := range heights {
+		if !hasPayloadByIdx[i] {
+			continue
+		}
 		summaries = append(summaries, summariesByIdx[i])
 		if !opts.DryRun {
 			payloads = append(payloads, payloadsByIdx[i])
@@ -311,9 +327,11 @@ func (s *Service) ReindexBlocks(ctx context.Context, heights []int64, opts Reind
 	affectedDays := sortedStringKeys(affectedDaySet)
 	affectedAddressIDs := sortedUint64Keys(affectedAddressSet)
 
-	opts.progressf("batch: deleting old rows for %d heights", len(batchHeights))
-	if err := s.deleteBlockDataBatch(ctx, batchHeights, opts); err != nil {
-		return nil, err
+	if !opts.SkipDelete {
+		opts.progressf("batch: deleting old rows for %d heights", len(batchHeights))
+		if err := s.deleteBlockDataBatch(ctx, batchHeights, opts); err != nil {
+			return nil, err
+		}
 	}
 
 	opts.progressf("batch: inserting fresh rows for %d heights", len(batchHeights))
@@ -755,35 +773,45 @@ func (s *Service) refreshRegisteredAccountsDailyTx(ctx context.Context, oldCount
 
 func (s *Service) deleteClickHouseWhere(ctx context.Context, table string, where string, opts ReindexOptions) error {
 	opts.progressf("ClickHouse %s: deleting rows where %s", table, where)
-	if err := s.ch.Conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DELETE WHERE %s", table, where)); err != nil {
+
+	deleteCtx := ctx
+	var cancel context.CancelFunc
+	if opts.DeleteTimeout > 0 {
+		deleteCtx, cancel = context.WithTimeout(ctx, opts.DeleteTimeout)
+		defer cancel()
+	}
+
+	stmt := fmt.Sprintf("ALTER TABLE %s DELETE WHERE %s SETTINGS mutations_sync=2", table, where)
+	if err := s.ch.Conn.Exec(deleteCtx, stmt); err != nil {
 		return fmt.Errorf("delete ClickHouse %s where %s: %w", table, where, err)
 	}
+	opts.progressf("ClickHouse %s: delete complete where %s", table, where)
+	return nil
+}
 
-	deadline := time.Now().Add(opts.DeleteTimeout)
-	lastProgress := time.Now()
-	for {
-		var remaining uint64
-		if err := s.ch.Conn.QueryRow(ctx, fmt.Sprintf("SELECT count() FROM %s WHERE %s", table, where)).Scan(&remaining); err != nil {
-			return fmt.Errorf("count ClickHouse %s where %s after delete: %w", table, where, err)
-		}
-		if remaining == 0 {
-			opts.progressf("ClickHouse %s: delete complete where %s", table, where)
-			return nil
-		}
-		if time.Since(lastProgress) >= opts.ProgressInterval {
-			opts.progressf("ClickHouse %s: waiting for delete, remaining_rows=%d where %s", table, remaining, where)
-			lastProgress = time.Now()
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for ClickHouse delete on %s where %s; %d rows still visible", table, where, remaining)
-		}
+func (s *Service) PreDeleteHeightsForReindex(ctx context.Context, heights []int64, opts ReindexOptions, chunkSize int) error {
+	if len(heights) == 0 {
+		return nil
+	}
+	if chunkSize <= 0 {
+		chunkSize = 1000
+	}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(opts.DeletePollInterval):
+	uHeights := make([]uint64, 0, len(heights))
+	for _, h := range heights {
+		if h <= 0 {
+			return fmt.Errorf("height must be > 0: %d", h)
+		}
+		uHeights = append(uHeights, uint64(h))
+	}
+
+	for i, chunk := range chunkUint64s(uHeights, chunkSize) {
+		opts.progressf("pre-delete: chunk %d/%d heights=%d", i+1, (len(uHeights)+chunkSize-1)/chunkSize, len(chunk))
+		if err := s.deleteBlockDataBatch(ctx, chunk, opts); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func sqlDay(t time.Time) string {
