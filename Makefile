@@ -16,6 +16,7 @@ build-tools:
 	@mkdir -p build
 	go build -o build/fix_tax ./cmd/tools/fix_tax
 	go build -o build/fix_timestamps ./cmd/tools/fix_timestamps
+	go build -o build/fcd_replay ./cmd/tools/fcd_replay
 	go build -o build/backfill_account_blocks ./cmd/tools/backfill_account_blocks
 	go build -o build/backfill_dashboard_aggregates ./cmd/tools/backfill_dashboard_aggregates
 	go build -o build/repair_missing_tx_data ./cmd/tools/repair_missing_tx_data
