@@ -76,7 +76,32 @@ type fcdLogEntry struct {
 	Log      json.RawMessage `json:"log"`
 	Events   []fcdEvent      `json:"events"`
 	Success  bool            `json:"success"`
-	MsgIndex int             `json:"msg_index"`
+	MsgIndex flexibleInt     `json:"msg_index"`
+}
+
+type flexibleInt int
+
+func (v *flexibleInt) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*v = 0
+		return nil
+	}
+
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		trimmed = trimmed[1 : len(trimmed)-1]
+		if trimmed == "" {
+			*v = 0
+			return nil
+		}
+	}
+
+	parsed, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return fmt.Errorf("parse flexible int %q: %w", trimmed, err)
+	}
+	*v = flexibleInt(parsed)
+	return nil
 }
 
 type fcdEvent struct {
