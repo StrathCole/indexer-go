@@ -12,6 +12,7 @@ import (
 
 	"github.com/classic-terra/indexer-go/internal/model"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
 )
 
 const fcdReplayPlaceholderBlockHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -297,16 +298,18 @@ func (s *Service) fcdCoinsToModel(ctx context.Context, coins []fcdCoin) ([]int64
 	amounts := make([]int64, 0, len(coins))
 	denomIDs := make([]uint16, 0, len(coins))
 	for _, coin := range coins {
-		if coin.Denom == "" || coin.Amount == "" {
+		denom := strings.TrimSpace(coin.Denom)
+		amountText := strings.TrimSpace(coin.Amount)
+		if denom == "" || amountText == "" {
 			continue
 		}
-		amount, err := strconv.ParseInt(coin.Amount, 10, 64)
+		amount, err := parseFCDCoinAmount(amountText, denom)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse amount %q: %w", coin.Amount, err)
 		}
-		denomID, err := s.dims.GetOrCreateDenomID(ctx, coin.Denom)
+		denomID, err := s.dims.GetOrCreateDenomID(ctx, denom)
 		if err != nil {
-			return nil, nil, fmt.Errorf("get denom id for %s: %w", coin.Denom, err)
+			return nil, nil, fmt.Errorf("get denom id for %s: %w", denom, err)
 		}
 		amounts = append(amounts, amount)
 		denomIDs = append(denomIDs, denomID)
@@ -320,25 +323,41 @@ func (s *Service) fcdTaxToModel(ctx context.Context, tax string) ([]int64, []uin
 		return nil, nil, nil
 	}
 
-	parts := strings.Split(tax, ",")
-	coins := make([]fcdCoin, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		split := strings.IndexFunc(part, func(r rune) bool {
-			return r < '0' || r > '9'
-		})
-		if split <= 0 || split >= len(part) {
-			return nil, nil, fmt.Errorf("invalid tax coin %q", part)
-		}
-		coins = append(coins, fcdCoin{
-			Amount: part[:split],
-			Denom:  part[split:],
-		})
+	coins, err := sdk.ParseCoinsNormalized(tax)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse tax coins %q: %w", tax, err)
 	}
-	return s.fcdCoinsToModel(ctx, coins)
+
+	amounts := make([]int64, 0, len(coins))
+	denomIDs := make([]uint16, 0, len(coins))
+	for _, coin := range coins {
+		amount, err := sdkCoinAmountInt64(coin)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse tax amount %q: %w", coin.Amount.String(), err)
+		}
+		denomID, err := s.dims.GetOrCreateDenomID(ctx, coin.Denom)
+		if err != nil {
+			return nil, nil, fmt.Errorf("get denom id for %s: %w", coin.Denom, err)
+		}
+		amounts = append(amounts, amount)
+		denomIDs = append(denomIDs, denomID)
+	}
+	return amounts, denomIDs, nil
+}
+
+func parseFCDCoinAmount(amount, denom string) (int64, error) {
+	coin, err := sdk.ParseCoinNormalized(strings.TrimSpace(amount) + strings.TrimSpace(denom))
+	if err != nil {
+		return 0, err
+	}
+	return sdkCoinAmountInt64(coin)
+}
+
+func sdkCoinAmountInt64(coin sdk.Coin) (int64, error) {
+	if !coin.Amount.IsInt64() {
+		return 0, fmt.Errorf("amount overflows int64: %s", coin.Amount.String())
+	}
+	return coin.Amount.Int64(), nil
 }
 
 func fcdEventsToABCI(events []fcdEvent) []abcitypes.Event {
