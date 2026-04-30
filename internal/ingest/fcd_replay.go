@@ -32,17 +32,17 @@ type fcdProposer struct {
 }
 
 type fcdTxResult struct {
-	Code      uint32         `json:"code"`
-	Codespace string         `json:"codespace"`
-	Events    []fcdEvent     `json:"events"`
-	GasUsed   string         `json:"gas_used"`
-	GasWanted string         `json:"gas_wanted"`
-	Height    string         `json:"height"`
-	Logs      []fcdLogEntry  `json:"logs"`
-	RawLog    string         `json:"raw_log"`
-	Timestamp time.Time      `json:"timestamp"`
-	Tx        fcdTxEnvelope  `json:"tx"`
-	TxHash    string         `json:"txhash"`
+	Code      uint32        `json:"code"`
+	Codespace string        `json:"codespace"`
+	Events    []fcdEvent    `json:"events"`
+	GasUsed   string        `json:"gas_used"`
+	GasWanted string        `json:"gas_wanted"`
+	Height    string        `json:"height"`
+	Logs      []fcdLogEntry `json:"logs"`
+	RawLog    string        `json:"raw_log"`
+	Timestamp time.Time     `json:"timestamp"`
+	Tx        fcdTxEnvelope `json:"tx"`
+	TxHash    string        `json:"txhash"`
 }
 
 type fcdTxEnvelope struct {
@@ -220,7 +220,7 @@ func (s *Service) convertFCDTx(height uint64, index uint16, blockTime time.Time,
 		signaturesJSON = append(signaturesJSON, string(signature))
 	}
 
-	gasWanted, err := parseUint64String(tx.GasWanted)
+	gasWanted, err := parseFCDGasWanted(tx)
 	if err != nil {
 		return model.Tx{}, nil, nil, fmt.Errorf("parse gas_wanted: %w", err)
 	}
@@ -382,6 +382,16 @@ func parseUint64String(value string) (uint64, error) {
 		return 0, err
 	}
 	return parsed, nil
+}
+
+func parseFCDGasWanted(tx fcdTxResult) (uint64, error) {
+	if strings.TrimSpace(tx.GasWanted) != "" {
+		return parseUint64String(tx.GasWanted)
+	}
+	if strings.TrimSpace(tx.Tx.Value.Fee.Gas) != "" {
+		return parseUint64String(tx.Tx.Value.Fee.Gas)
+	}
+	return 0, fmt.Errorf("missing gas_wanted and fee.gas")
 }
 
 func fcdCodespace(tx fcdTxResult) string {
