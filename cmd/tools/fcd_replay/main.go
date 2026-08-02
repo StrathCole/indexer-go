@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,9 +21,11 @@ func main() {
 	fromHeight := flag.Int64("from-height", 0, "Inclusive start height for replay range")
 	toHeight := flag.Int64("to-height", 0, "Inclusive end height for replay range")
 	dryRun := flag.Bool("dry-run", false, "Fetch and convert blocks without inserting data")
-	continueOnError := flag.Bool("continue-on-error", true, "Skip failed heights and continue")
+	continueOnError := flag.Bool("continue-on-error", true, "Deprecated compatibility flag; failed heights always stop replay")
 	progressEvery := flag.Int("progress-every", 100, "Log a progress line every N processed heights")
 	requestTimeout := flag.Duration("request-timeout", 30*time.Second, "Per-block fetch and insert timeout")
+	maxRetries := flag.Int("max-retries", 5, "Maximum retries for transient failures per height")
+	retryBackoff := flag.Duration("retry-backoff", time.Second, "Initial retry backoff; it doubles after each failed attempt")
 	flag.Parse()
 
 	start, end, err := collectTargetRange(*height, *fromHeight, *toHeight)
@@ -34,6 +37,12 @@ func main() {
 	}
 	if *requestTimeout <= 0 {
 		log.Fatalf("--request-timeout must be > 0")
+	}
+	if *maxRetries < 0 {
+		log.Fatalf("--max-retries must be >= 0")
+	}
+	if *retryBackoff <= 0 {
+		log.Fatalf("--retry-backoff must be > 0")
 	}
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -87,56 +96,45 @@ func main() {
 
 	for offset := int64(0); offset < total; offset++ {
 		currentHeight := start + offset
-		ctx, cancel := context.WithTimeout(context.Background(), *requestTimeout)
-
-		exists, err := svc.HeightHasStoredData(ctx, currentHeight)
+		outcome, err := replayHeightWithRetry(
+			context.Background(),
+			svc,
+			*fcdBaseURL,
+			currentHeight,
+			*dryRun,
+			*requestTimeout,
+			*maxRetries,
+			*retryBackoff,
+			func(retry int, delay time.Duration, retryErr error) {
+				log.Printf(
+					"Height %d: retry %d/%d in %s after %v",
+					currentHeight,
+					retry,
+					*maxRetries,
+					delay,
+					retryErr,
+				)
+			},
+		)
 		if err != nil {
-			cancel()
-			if !*continueOnError {
-				log.Fatalf("Height %d: failed to check existing data: %v", currentHeight, err)
+			stage := replayErrorStage(err)
+			if *continueOnError {
+				log.Printf("Height %d: %s failed; stopping replay so this height is not skipped", currentHeight, stage)
 			}
-			failed++
-			log.Printf("Height %d: existing-data check failed: %v", currentHeight, err)
-			continue
+			log.Fatalf("Height %d: %s failed after %d retries: %v", currentHeight, stage, *maxRetries, err)
 		}
-		if exists {
-			cancel()
+
+		if outcome.skipped {
 			skipped++
 			if shouldLogProgress(offset+1, total, *progressEvery) {
 				log.Printf("Progress %d/%d: skipped=%d replayed=%d failed=%d", offset+1, total, skipped, replayed, failed)
 			}
 			continue
 		}
-
-		block, txs, events, accountTxs, err := svc.FetchAndConvertFCDBlock(ctx, *fcdBaseURL, currentHeight)
-		if err != nil {
-			cancel()
-			if !*continueOnError {
-				log.Fatalf("Height %d: fetch/convert failed: %v", currentHeight, err)
-			}
-			failed++
-			log.Printf("Height %d: fetch/convert failed: %v", currentHeight, err)
-			continue
-		}
-
-		if !*dryRun {
-			err = svc.BatchInsert(ctx, []model.Block{block}, txs, events, accountTxs, nil, nil, nil)
-			if err != nil {
-				cancel()
-				if !*continueOnError {
-					log.Fatalf("Height %d: insert failed: %v", currentHeight, err)
-				}
-				failed++
-				log.Printf("Height %d: insert failed: %v", currentHeight, err)
-				continue
-			}
-		}
-
-		cancel()
 		replayed++
-		txsInserted += int64(len(txs))
-		eventsInserted += int64(len(events))
-		accountTxsInserted += int64(len(accountTxs))
+		txsInserted += outcome.txs
+		eventsInserted += outcome.events
+		accountTxsInserted += outcome.accountTxs
 
 		if shouldLogProgress(offset+1, total, *progressEvery) {
 			log.Printf(
@@ -191,4 +189,205 @@ func shouldLogProgress(processed, total int64, every int) bool {
 		return true
 	}
 	return processed%int64(every) == 0
+}
+
+type replayStage string
+
+const (
+	replayStageExistingData  replayStage = "existing-data check"
+	replayStageFetchConvert  replayStage = "fetch/convert"
+	replayStageInsert        replayStage = "insert"
+	replayStagePartialInsert replayStage = "partial insert"
+	maxRetryBackoff                      = 30 * time.Second
+)
+
+type replayError struct {
+	stage replayStage
+	err   error
+}
+
+func (e *replayError) Error() string {
+	return e.err.Error()
+}
+
+func (e *replayError) Unwrap() error {
+	return e.err
+}
+
+type replayOutcome struct {
+	skipped    bool
+	txs        int64
+	events     int64
+	accountTxs int64
+}
+
+func replayHeightWithRetry(
+	parentCtx context.Context,
+	svc *ingest.Service,
+	fcdBaseURL string,
+	height int64,
+	dryRun bool,
+	requestTimeout time.Duration,
+	maxRetries int,
+	retryBackoff time.Duration,
+	onRetry func(retry int, delay time.Duration, err error),
+) (replayOutcome, error) {
+	var outcome replayOutcome
+	insertAttempted := false
+	err := retryWithExponentialBackoff(parentCtx, maxRetries, retryBackoff, func() error {
+		attemptCtx, cancel := context.WithTimeout(parentCtx, requestTimeout)
+		defer cancel()
+
+		nextOutcome, err := replayHeight(attemptCtx, svc, fcdBaseURL, height, dryRun)
+		if err != nil {
+			if replayErrorHasStage(err, replayStageInsert) {
+				insertAttempted = true
+			}
+			return err
+		}
+		if insertAttempted && nextOutcome.skipped {
+			return &replayError{
+				stage: replayStagePartialInsert,
+				err:   fmt.Errorf("height %d has stored rows after a previous insert failure", height),
+			}
+		}
+		outcome = nextOutcome
+		return nil
+	}, onRetry)
+	return outcome, err
+}
+
+func replayHeight(
+	ctx context.Context,
+	svc *ingest.Service,
+	fcdBaseURL string,
+	height int64,
+	dryRun bool,
+) (replayOutcome, error) {
+	exists, err := svc.HeightHasStoredData(ctx, height)
+	if err != nil {
+		return replayOutcome{}, &replayError{stage: replayStageExistingData, err: err}
+	}
+	if exists {
+		return replayOutcome{skipped: true}, nil
+	}
+
+	block, txs, events, accountTxs, err := svc.FetchAndConvertFCDBlock(ctx, fcdBaseURL, height)
+	if err != nil {
+		return replayOutcome{}, &replayError{stage: replayStageFetchConvert, err: err}
+	}
+
+	if !dryRun {
+		if err := svc.BatchInsert(ctx, []model.Block{block}, txs, events, accountTxs, nil, nil, nil); err != nil {
+			return replayOutcome{}, &replayError{stage: replayStageInsert, err: err}
+		}
+	}
+
+	return replayOutcome{
+		txs:        int64(len(txs)),
+		events:     int64(len(events)),
+		accountTxs: int64(len(accountTxs)),
+	}, nil
+}
+
+func retryWithExponentialBackoff(
+	ctx context.Context,
+	maxRetries int,
+	initialBackoff time.Duration,
+	operation func() error,
+	onRetry func(retry int, delay time.Duration, err error),
+) error {
+	if maxRetries < 0 {
+		return fmt.Errorf("max retries must be >= 0")
+	}
+	if initialBackoff <= 0 {
+		return fmt.Errorf("initial backoff must be > 0")
+	}
+
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		err := operation()
+		if err == nil {
+			return nil
+		}
+		if attempt >= maxRetries || !isRetryableReplayError(err) {
+			return err
+		}
+
+		delay := retryDelay(initialBackoff, attempt)
+		if onRetry != nil {
+			onRetry(attempt+1, delay, err)
+		}
+		if err := waitForRetry(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+func isRetryableReplayError(err error) bool {
+	var replayErr *replayError
+	if !errors.As(err, &replayErr) {
+		return errors.Is(err, context.DeadlineExceeded)
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	switch replayErr.stage {
+	case replayStageExistingData, replayStageInsert:
+		return true
+	case replayStageFetchConvert:
+		return ingest.IsRetryableFCDReplayError(err)
+	default:
+		return false
+	}
+}
+
+func replayErrorHasStage(err error, stage replayStage) bool {
+	var replayErr *replayError
+	return errors.As(err, &replayErr) && replayErr.stage == stage
+}
+
+func replayErrorStage(err error) string {
+	var replayErr *replayError
+	if errors.As(err, &replayErr) {
+		return string(replayErr.stage)
+	}
+	return "replay"
+}
+
+func retryDelay(initialBackoff time.Duration, retry int) time.Duration {
+	if retry <= 0 {
+		if initialBackoff > maxRetryBackoff {
+			return maxRetryBackoff
+		}
+		return initialBackoff
+	}
+
+	delay := initialBackoff
+	for i := 0; i < retry; i++ {
+		if delay >= maxRetryBackoff/2 {
+			return maxRetryBackoff
+		}
+		delay *= 2
+	}
+	if delay > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+	return delay
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

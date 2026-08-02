@@ -3,13 +3,16 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	sdkmath "cosmossdk.io/math"
 	"github.com/classic-terra/indexer-go/internal/model"
 	abcitypes "github.com/cometbft/cometbft/abci/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -115,6 +118,54 @@ type fcdEventAttrPair struct {
 	Value string `json:"value"`
 }
 
+type fcdHTTPError struct {
+	height     int64
+	statusCode int
+	status     string
+	body       string
+}
+
+type fcdDatabaseError struct {
+	err error
+}
+
+func (e *fcdDatabaseError) Error() string {
+	return e.err.Error()
+}
+
+func (e *fcdDatabaseError) Unwrap() error {
+	return e.err
+}
+
+func (e *fcdHTTPError) Error() string {
+	return fmt.Sprintf("fcd block %d returned %s: %s", e.height, e.status, e.body)
+}
+
+// IsRetryableFCDReplayError reports whether an FCD fetch error is likely transient.
+func IsRetryableFCDReplayError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+
+	var httpErr *fcdHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.statusCode == http.StatusRequestTimeout ||
+			httpErr.statusCode == http.StatusTooManyRequests ||
+			httpErr.statusCode >= http.StatusInternalServerError
+	}
+
+	var databaseErr *fcdDatabaseError
+	return errors.As(err, &databaseErr)
+}
+
 func (s *Service) HeightHasStoredData(ctx context.Context, height int64) (bool, error) {
 	exists, err := s.pg.BlockExists(ctx, height)
 	if err != nil {
@@ -157,7 +208,12 @@ func (s *Service) FetchAndConvertFCDBlock(ctx context.Context, baseURL string, h
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return model.Block{}, nil, nil, nil, fmt.Errorf("fcd block %d returned %s: %s", height, resp.Status, strings.TrimSpace(string(body)))
+		return model.Block{}, nil, nil, nil, &fcdHTTPError{
+			height:     height,
+			statusCode: resp.StatusCode,
+			status:     resp.Status,
+			body:       strings.TrimSpace(string(body)),
+		}
 	}
 
 	var payload fcdBlockResponse
@@ -181,7 +237,7 @@ func (s *Service) FetchAndConvertFCDBlock(ctx context.Context, baseURL string, h
 	modelAccountTxs := make([]model.AccountTx, 0)
 
 	for idx, tx := range payload.Txs {
-		modelTx, txEvents, accountTxs, err := s.convertFCDTx(uint64(payload.Height), uint16(idx), payload.Timestamp, tx)
+		modelTx, txEvents, accountTxs, err := s.convertFCDTx(ctx, uint64(payload.Height), uint16(idx), payload.Timestamp, tx)
 		if err != nil {
 			return model.Block{}, nil, nil, nil, fmt.Errorf("convert fcd tx at height %d index %d: %w", height, idx, err)
 		}
@@ -193,13 +249,13 @@ func (s *Service) FetchAndConvertFCDBlock(ctx context.Context, baseURL string, h
 	return modelBlock, modelTxs, modelEvents, modelAccountTxs, nil
 }
 
-func (s *Service) convertFCDTx(height uint64, index uint16, blockTime time.Time, tx fcdTxResult) (model.Tx, []model.Event, []model.AccountTx, error) {
-	feeAmounts, feeDenomIDs, err := s.fcdCoinsToModel(context.Background(), tx.Tx.Value.Fee.Amount)
+func (s *Service) convertFCDTx(ctx context.Context, height uint64, index uint16, blockTime time.Time, tx fcdTxResult) (model.Tx, []model.Event, []model.AccountTx, error) {
+	feeAmounts, feeDenomIDs, err := s.fcdCoinsToModel(ctx, tx.Tx.Value.Fee.Amount)
 	if err != nil {
 		return model.Tx{}, nil, nil, fmt.Errorf("convert fees: %w", err)
 	}
 
-	taxAmounts, taxDenomIDs, err := s.fcdTaxToModel(context.Background(), tx.Tx.Value.Tax)
+	taxAmounts, taxDenomIDs, err := s.fcdTaxToModel(ctx, tx.Tx.Value.Tax)
 	if err != nil {
 		return model.Tx{}, nil, nil, fmt.Errorf("convert tax: %w", err)
 	}
@@ -207,9 +263,9 @@ func (s *Service) convertFCDTx(height uint64, index uint16, blockTime time.Time,
 	msgTypeIDs := make([]uint16, 0, len(tx.Tx.Value.Msg))
 	msgsJSON := make([]string, 0, len(tx.Tx.Value.Msg))
 	for _, msg := range tx.Tx.Value.Msg {
-		id, err := s.dims.GetOrCreateMsgTypeID(context.Background(), msg.Type)
+		id, err := s.dims.GetOrCreateMsgTypeID(ctx, msg.Type)
 		if err != nil {
-			return model.Tx{}, nil, nil, fmt.Errorf("get msg type id for %s: %w", msg.Type, err)
+			return model.Tx{}, nil, nil, fmt.Errorf("get msg type id for %s: %w", msg.Type, &fcdDatabaseError{err: err})
 		}
 		msgTypeIDs = append(msgTypeIDs, id)
 		msgsJSON = append(msgsJSON, string(msg.Value))
@@ -286,9 +342,9 @@ func (s *Service) convertFCDTx(height uint64, index uint16, blockTime time.Time,
 		}
 	}
 
-	accountTxs, _, err := s.extractAccountTxs(context.Background(), height, index, blockTime, txHash, abciEvents)
+	accountTxs, _, err := s.extractAccountTxs(ctx, height, index, blockTime, txHash, abciEvents)
 	if err != nil {
-		return model.Tx{}, nil, nil, fmt.Errorf("extract account txs: %w", err)
+		return model.Tx{}, nil, nil, fmt.Errorf("extract account txs: %w", &fcdDatabaseError{err: err})
 	}
 
 	return modelTx, modelEvents, accountTxs, nil
@@ -309,7 +365,7 @@ func (s *Service) fcdCoinsToModel(ctx context.Context, coins []fcdCoin) ([]int64
 		}
 		denomID, err := s.dims.GetOrCreateDenomID(ctx, denom)
 		if err != nil {
-			return nil, nil, fmt.Errorf("get denom id for %s: %w", denom, err)
+			return nil, nil, fmt.Errorf("get denom id for %s: %w", denom, &fcdDatabaseError{err: err})
 		}
 		amounts = append(amounts, amount)
 		denomIDs = append(denomIDs, denomID)
@@ -337,7 +393,7 @@ func (s *Service) fcdTaxToModel(ctx context.Context, tax string) ([]int64, []uin
 		}
 		denomID, err := s.dims.GetOrCreateDenomID(ctx, coin.Denom)
 		if err != nil {
-			return nil, nil, fmt.Errorf("get denom id for %s: %w", coin.Denom, err)
+			return nil, nil, fmt.Errorf("get denom id for %s: %w", coin.Denom, &fcdDatabaseError{err: err})
 		}
 		amounts = append(amounts, amount)
 		denomIDs = append(denomIDs, denomID)
@@ -346,11 +402,21 @@ func (s *Service) fcdTaxToModel(ctx context.Context, tax string) ([]int64, []uin
 }
 
 func parseFCDCoinAmount(amount, denom string) (int64, error) {
-	coin, err := sdk.ParseCoinNormalized(strings.TrimSpace(amount) + strings.TrimSpace(denom))
+	denom = strings.TrimSpace(denom)
+	if err := sdk.ValidateDenom(denom); err != nil {
+		return 0, err
+	}
+
+	decimalAmount, err := sdkmath.LegacyNewDecFromStr(strings.TrimSpace(amount))
 	if err != nil {
 		return 0, err
 	}
-	return sdkCoinAmountInt64(coin)
+
+	intAmount := decimalAmount.TruncateInt()
+	if !intAmount.IsInt64() {
+		return 0, fmt.Errorf("amount overflows int64: %s", intAmount.String())
+	}
+	return intAmount.Int64(), nil
 }
 
 func sdkCoinAmountInt64(coin sdk.Coin) (int64, error) {
